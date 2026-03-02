@@ -4,9 +4,14 @@
 ![Architecture](https://img.shields.io/badge/arch-x86_32--bit-red.svg)
 ![License](https://img.shields.io/badge/license-Freeware-green.svg)
 
+<img width="1280" height="720" alt="miniatura_Ante-M" src="https://github.com/user-attachments/assets/8b46803c-6b04-4937-a5f3-08228682edf3" />
+
+
 **Ante-Millennium OS** è un sistema operativo sperimentale a 32-bit (x86) scritto interamente da zero (bare-metal) in C e Assembly. 
 
 Nasce come progetto di esplorazione tecnica per ricreare l'architettura dei sistemi operativi classici, unita a un'interfaccia grafica ("Retained Mode") ispirata all'estetica iconica degli anni '90 e dei primi anni 2000. Il sistema è autosufficiente, non si appoggia ad alcuna libreria standard (compilato in `-ffreestanding -nostdlib`) e comunica direttamente con l'hardware.
+
+<img width="1022" height="765" alt="screenshot" src="https://github.com/user-attachments/assets/802f7929-1f46-44b2-8f84-81db2533a83b" />
 
 ---
 
