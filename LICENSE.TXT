@@ -1,0 +1,48 @@
+Licenza d'Uso di Ante-Millennium OS (Freeware License)
+
+Copyright (c) 2026 Alberto Sanfelice (511break). Tutti i diritti riservati.
+
+Questo software (Ante-Millennium OS) è concesso in licenza d'uso gratuita, non venduto. L'autore e detentore del copyright è Alberto Sanfelice (511break).
+
+Scaricando, utilizzando o distribuendo questo software, accetti le seguenti condizioni:
+
+1. Uso e Condivisione (Freeware)
+Il sistema operativo è gratuito per qualsiasi uso personale o educativo. Sei libero di copiare, distribuire e condividere i file binari (es. immagini disco, file eseguibili .edxi) su forum, siti web o tra amici, purché il software venga offerto in modo totalmente gratuito.
+
+2. Obbligo di Attribuzione
+Se decidi di caricare o condividere il sistema operativo altrove, devi citare chiaramente e visibilmente l'autore originale (Alberto Sanfelice / 511break) e, ove possibile, inserire un link al progetto originale o al canale YouTube ufficiale. Non puoi far passare questo lavoro come tuo.
+
+3. Reverse Engineering e Modifiche Permesse
+Contrariamente ai classici software proprietari, l'autore incoraggia la curiosità tecnica. Sei esplicitamente autorizzato a disassemblare, retro-ingegnerizzare o studiare i file binari del sistema operativo e delle sue applicazioni per scopi didattici o di esplorazione personale.
+
+4. Codice Sorgente Chiuso
+Al momento, il codice sorgente originale in C e Assembly non è pubblico e rimane di proprietà esclusiva dell'autore. L'autore si riserva il diritto di rilasciare il codice sorgente sotto una licenza Open Source in futuro, a sua totale discrezione.
+
+5. Nessuna Garanzia (Disclaimer)
+Questo sistema operativo è un progetto sperimentale ("bare-metal") fornito "COSÌ COM'È", senza alcuna garanzia esplicita o implicita. L'autore non è responsabile per eventuali perdite di dati, danni all'hardware o problemi derivanti dall'uso o dall'installazione del sistema, specialmente se eseguito su macchine fisiche anziché su emulatori.
+
+
+[EN]
+
+Ante-Millennium OS End User License Agreement (Freeware License)
+
+Copyright (c) 2026 Alberto Sanfelice (511break). All rights reserved. 
+
+This software (Ante-Millennium OS) is licensed for free use, not sold. The author and copyright holder is Alberto Sanfelice (511break).
+
+By downloading, using, or distributing this software, you agree to the following terms:
+
+1. Use and Sharing (Freeware)
+The operating system is free for any personal or educational use. You are free to copy, distribute, and share the binary files (e.g., disk images, .edxi executables) on forums, websites, or with friends, provided the software is offered completely free of charge.
+
+2. Attribution Requirement
+If you decide to upload or share the operating system elsewhere, you must clearly and visibly credit the original author (Alberto Sanfelice / 511break) and, where possible, include a link to the original project or the official YouTube channel. You may not claim this work as your own.
+
+3. Reverse Engineering and Modifications Permitted
+Unlike traditional proprietary software, the author encourages technical curiosity. You are explicitly authorized to disassemble, reverse-engineer, or study the binary files of the operating system and its applications for educational purposes or personal exploration.
+
+4. Closed Source Code
+At present, the original C and Assembly source code is not public and remains the exclusive property of the author. The author reserves the right to release the source code under an Open Source license in the future, at their sole discretion.
+
+5. No Warranty (Disclaimer)
+This operating system is an experimental ("bare-metal") project provided "AS IS", without any express or implied warranty. The author is not liable for any data loss, hardware damage, or issues arising from the use or installation of the system, especially if run on physical hardware rather than emulators
