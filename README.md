@@ -6,24 +6,23 @@
 
 <img width="1280" height="720" alt="miniatura_Ante-M" src="https://github.com/user-attachments/assets/8b46803c-6b04-4937-a5f3-08228682edf3" />
 
-
 **Ante-Millennium OS** è un sistema operativo sperimentale a 32-bit (x86) scritto interamente da zero (bare-metal) in C e Assembly. 
 
-Nasce come progetto di esplorazione tecnica per ricreare l'architettura dei sistemi operativi classici, unita a un'interfaccia grafica ("Retained Mode") ispirata all'estetica iconica degli anni '90 e dei primi anni 2000. Il sistema è autosufficiente, non si appoggia ad alcuna libreria standard (compilato in `-ffreestanding -nostdlib`) e comunica direttamente con l'hardware.
+Nasce come progetto di esplorazione tecnica per ricreare l'architettura dei sistemi operativi classici, unita a un'interfaccia grafica ("Retained Mode") ispirata all'estetica iconica degli anni '90 e dei primi anni 2000. Il sistema è autosufficiente, non si appoggia ad alcuna libreria standard esterna e comunica direttamente con l'hardware.
 
-<img width="1022" height="765" alt="screenshot" src="https://github.com/user-attachments/assets/802f7929-1f46-44b2-8f84-81db2533a83b" />
+<img width="1024" height="769" alt="build49" src="https://github.com/user-attachments/assets/bf33a3f2-cc35-432b-8ac2-fc89babfab8f" />
+
 
 ---
 
-## ✨ Architettura e Core Features
+## ✨ Architettura e Novità della Build 49 0.1 Alpha
 
-Nonostante la sua natura sperimentale, Ante-M implementa concetti avanzati di Ingegneria del Software:
+L'ultima evoluzione del sistema introduce cambiamenti strutturali profondi, implementando concetti avanzati di Ingegneria dei Sistemi Operativi:
 
-* 🖥️ **Window Manager e GUI "Retained Mode":** Sistema gerarchico di finestre sovrapponibili con gestione dinamica dello Z-Index. Il rendering avviene interamente in memoria tramite Double-Buffering prima di essere inviato alla VRAM, garantendo animazioni fluide e assenza totale di sfarfallii (flickering). Include patch algoritmiche "anti-fantasma" per la gestione rigorosa dei click del mouse.
-* ⏱️ **Multitasking Preemptive:** Il cuore del sistema. Uno scheduler basato su un Programmable Interval Timer (PIT) hardware impostato a 100Hz gestisce il context-switching dei registri della CPU. Questo permette di eseguire processi e applicazioni in parallelo in totale sicurezza tramite un algoritmo Round-Robin.
-* 💾 **Driver Disco ATA PIO & File System Ext2:** Stack I/O di archiviazione scritto da zero. Il kernel interroga il disco rigido bypassando il BIOS, leggendo le Tabelle Inode e le Bitmap del File System Ext2. È in grado di allocare dinamicamente blocchi, creare file testuali e manipolare directory entry in tempo reale.
-* 🧠 **Heap Memory Manager:** Sistema custom di allocazione dinamica della RAM (`kmalloc` e `kfree`) a partire dal 16° Megabyte. Implementa algoritmi di *First-Fit* con splitting dei blocchi e deframmentazione automatica ("on-the-fly" merging).
-* ⚙️ **Application Programming Interface (API):** Un portiere Assembly intercetta l'Interrupt `0x80` per fornire un set di chiamate di sistema (Syscall) sicure, permettendo ai processi utente (`.bin` e `.edxi`) di stampare a schermo, leggere il mouse e disegnare sulla propria interfaccia grafica dedicata.
+* 🖥️ **Window Manager Event-Driven e Taskbar:** Il rendering avviene in memoria tramite Double-Buffering per garantire animazioni fluide (zero flickering). È stato introdotto un vero Menu interattivo, una Taskbar con gestione delle icone e animazioni per la chiusura e riduzione a icona delle finestre. Il consumo di CPU è abbattuto da una funzione che risveglia i processi dormienti solo quando l'utente vi interagisce.
+* 🛡️ **Ring 3 e Memoria Virtuale (Paging):** Le applicazioni sono ora relegate nello User Mode (Ring 3) per garantire l'isolamento dal Kernel. Il sistema mappa la memoria virtuale assegnando dinamicamente pagine di RAM protette (512 KB per app), gestendo il context-switching dei registri (incluso il TSS per lo stack di emergenza) tramite lo scheduler a 100Hz.
+* 🗂️ **File System Ext2:** Il driver ATA PIO interroga il disco rigido. È stato introdotto un *Path Parser* (`ext2_resolve_path`) capace di navigare un albero di directory tramite percorsi assoluti, permettendo la lettura, scrittura e creazione sicura di file e cartelle ovunque nel disco.
+* 📚 **Libreria Standard Custom (antem_libc):** Le applicazioni in Ring 3 sono ora supportate da una libreria C proprietaria scritta da zero, dotata di un gestore per l'Heap User Space (`malloc`/`free`), parser di stringhe e un set unificato di API per accedere alle funzionalità del Kernel tramite l'Interrupt `0x80`.
 
 ---
 
@@ -45,21 +44,23 @@ qemu-system-i386 -kernel Ante-M.bin -drive file=disk.img,format=raw,index=0,medi
 
 ## ⌨️ Comandi Terminale Disponibili
 
-Il Terminale integrato permette di interagire direttamente con il Kernel e il File System. Digita `help` per una lista rapida, oppure prova i seguenti comandi:
+Il Terminale integrato permette di interagire direttamente con il Kernel e il File System gerarchico. Digita `help` per una lista rapida:
 
-### File System (Ext2)
-* `ls` : Esplora la directory principale (Root) stampando la lista dei file.
-* `cat [nomefile]` : Cerca il file richiesto e ne stampa il contenuto a schermo gestendo l'impaginazione.
-* `rm [nomefile]` : Elimina in modo sicuro un file, smontando la sua Directory Entry e riciclando lo spazio nelle Bitmap.
-* `fsinfo` : Interroga il Superblocco del disco mostrando le statistiche totali (Inode e Blocchi formattati).
+### File System (Gerarchico)
+* `ls [path]` : Elenca file e directory esplorando i percorsi.
+* `mkdir [path]` : Crea una nuova cartella nel percorso specificato.
+* `cat [path]` : Legge il contenuto di un file.
+* `create [p][t]` : Crea file testuali con il contenuto specificato.
+* `rm [path]` : Elimina file in modo sicuro (non le cartelle).
+* `fsinfo` : Statistiche disco Ext2 leggendo il Superblocco.
 
 ### Sistema e Multitasking
-* `run [app.bin/.edxi]` : Caricatore ed esecutore di programmi. Legge l'header del file, alloca l'eseguibile in RAM e genera un nuovo processo.
-* `ps` : Mostra la tabella dei processi attivi, indicando PID, ID Finestra e Stato (RUN/SLEEP).
-* `kill [PID]` : Termina forzatamente il processo specificato, de-allocando istantaneamente lo stack privato e la RAM base utilizzata.
-* `meminfo` : Analizza lo stato della memoria dinamica (Heap) stampando byte utilizzati, byte liberi e frammentazione.
-* `time` : Interroga il Real Time Clock (CMOS) per data e ora.
-* `clear` : Pulisce la memoria video del terminale.
+* `run [app]` : Lancia eseguibile .edxi o .bin risolvendone il percorso in automatico.
+* `ps` : Lista processi attivi, mostrando PID, ID Finestra e stato (RUN/SLEEP).
+* `kill [PID]` : Termina un processo e libera la sua RAM.
+* `meminfo` : Mostra lo stato dell'Heap e della RAM Kernel eseguendo test di allocazione.
+* `time` : Legge data e ora dal chip hardware CMOS.
+* `info` / `clear` : Info sistema / Pulisce il terminale.
 
 ---
 
