@@ -2,27 +2,31 @@
 
 ![Version](https://img.shields.io/badge/version-0.1_Alpha-blue.svg)
 ![Architecture](https://img.shields.io/badge/arch-x86_32--bit-red.svg)
-![License](https://img.shields.io/badge/license-Freeware-green.svg)
+![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)
 
-<img width="1280" height="720" alt="miniatura_Ante-M" src="https://github.com/user-attachments/assets/8b46803c-6b04-4937-a5f3-08228682edf3" />
+**PAGINA IN AGGIORNAMENTO - è in corso il rilascio della build 85 del sistema.**
+
+<img width="870" height="616" alt="FLAT_BIANCO_NUOVISSIMO_TESTO_LOGO_DEFINITIVO_ANTE_M" src="https://github.com/user-attachments/assets/3dd02963-0615-4d2e-be62-85f315b9cc59" />
+
 
 **Ante-Millennium OS** è un sistema operativo sperimentale a 32-bit (x86) scritto interamente da zero (bare-metal) in C e Assembly. 
 
-Nasce come progetto di esplorazione tecnica per ricreare l'architettura dei sistemi operativi classici, unita a un'interfaccia grafica ("Retained Mode") ispirata all'estetica iconica degli anni '90 e dei primi anni 2000. Il sistema è autosufficiente, non si appoggia ad alcuna libreria standard esterna e comunica direttamente con l'hardware.
+Nasce come progetto di esplorazione tecnica per ricreare le complesse architetture dei sistemi operativi classici (tra cui Multitasking Preemptive, Demand Paging, Virtual File System Ext2 e Moduli Kernel Caricabili), unita a un'interfaccia grafica nativa ("Retained Mode") ispirata all'estetica iconica degli anni '90 e dei primi anni 2000. Il sistema è un ecosistema totalmente autosufficiente: non si appoggia ad alcuna libreria standard o codice di terze parti, comunica direttamente con l'hardware e include un proprio SDK (la libreria antem_libc) per lo sviluppo e la compilazione di applicazioni User-Space nel formato proprietario .edxi.
 
-<img width="1024" height="769" alt="build49" src="https://github.com/user-attachments/assets/bf33a3f2-cc35-432b-8ac2-fc89babfab8f" />
+
+<img width="1024" height="769" alt="Screenshot 2026-03-30 alle 22 48 59" src="https://github.com/user-attachments/assets/8e9c03fd-b8dc-4493-a33b-61e67edc0e11" />
 
 
 ---
 
-## ✨ Architettura e Novità della Build 49 0.1 Alpha
+## ✨ Architettura e Novità della Build 85 0.1 Alpha
 
 L'ultima evoluzione del sistema introduce cambiamenti strutturali profondi, implementando concetti avanzati di Ingegneria dei Sistemi Operativi:
 
-* 🖥️ **Window Manager Event-Driven e Taskbar:** Il rendering avviene in memoria tramite Double-Buffering per garantire animazioni fluide (zero flickering). È stato introdotto un vero Menu interattivo, una Taskbar con gestione delle icone e animazioni per la chiusura e riduzione a icona delle finestre. Il consumo di CPU è abbattuto da una funzione che risveglia i processi dormienti solo quando l'utente vi interagisce.
-* 🛡️ **Ring 3 e Memoria Virtuale (Paging):** Le applicazioni sono ora relegate nello User Mode (Ring 3) per garantire l'isolamento dal Kernel. Il sistema mappa la memoria virtuale assegnando dinamicamente pagine di RAM protette (512 KB per app), gestendo il context-switching dei registri (incluso il TSS per lo stack di emergenza) tramite lo scheduler a 100Hz.
-* 🗂️ **File System Ext2:** Il driver ATA PIO interroga il disco rigido. È stato introdotto un *Path Parser* (`ext2_resolve_path`) capace di navigare un albero di directory tramite percorsi assoluti, permettendo la lettura, scrittura e creazione sicura di file e cartelle ovunque nel disco.
-* 📚 **Libreria Standard Custom (antem_libc):** Le applicazioni in Ring 3 sono ora supportate da una libreria C proprietaria scritta da zero, dotata di un gestore per l'Heap User Space (`malloc`/`free`), parser di stringhe e un set unificato di API per accedere alle funzionalità del Kernel tramite l'Interrupt `0x80`.
+* 🖥️ **Window Manager Event-Driven e Taskbar:** Il rendering dell'interfaccia grafica avviene in memoria tramite Double-Buffering per garantire l'assenza totale di flickering. Il sistema vanta un Menu Start interattivo (protetto da logiche di Z-Ordering), una Taskbar con gestione dinamica dello spazio e icone a 16 colori. Le animazioni di chiusura e riduzione a icona sono guidate da un motore asincrono basato su Interpolazione Lineare (Lerp) agganciato al timer hardware, per traiettorie fluide e pixel-perfect. Il consumo di CPU è drasticamente ottimizzato tramite un V-Sync ibrido (50/100 FPS) e uno Scheduler intelligente che addormenta i processi in Ring 3 (Syscall Yield), risvegliando rigorosamente solo l'applicazione con il focus attivo nel momento esatto dell'input utente. Le finestre supportano inoltre il ridimensionamento Content-Aware, adattando i propri limiti all'interfaccia interna.
+* 🛡️ **Ring 3, Paging e Demand Paging:** Le applicazioni operano in totale isolamento nello User Mode (Ring 3), protette da un'architettura di memoria virtuale avanzata. Il sistema implementa un Physical Frame Allocator (PFA) basato su bitmap per la gestione di RAM fisica fino a 1 GB. Invece di allocazioni statiche, il Kernel utilizza il Demand Paging: la memoria viene mappata dinamicamente in pagine da 4 KB solo quando l'applicazione ne fa effettiva richiesta, gestendo i Page Fault hardware in tempo reale. Ogni processo dispone di una Page Table privata, garantendo l'integrità dei dati durante il context-switching eseguito dallo scheduler a 100 Hz. Il sistema gestisce correttamente il passaggio tra Ring tramite il Task State Segment (TSS) per la messa in sicurezza dello stack di emergenza del Kernel.
+* 🗂️ **File System Ext2 e VFS:** Il driver ATA PIO è stato potenziato con il supporto LBA48 per interfacciarsi con dischi di grandi dimensioni. Al Path Parser di base è stato affiancato un Virtual File System (VFS) completo che gestisce l'allocazione dinamica di Blocchi e Inode interrogando le Bitmap dei vari Block Groups. Il traduttore di blocchi supporta nativamente i puntatori Singoli e Doppi Indiretti, abbattendo i limiti di grandezza dei file. Sono stati integrati motori complessi per l'eliminazione sicura dei dati, la distruzione ricorsiva delle directory e un sistema di copia file in streaming ad altissima efficienza (1 KB di RAM utilizzata), blindato da un VFS Lock globale (Spinlock) per prevenire la corruzione dei dati causata da operazioni di I/O concorrenti nello scheduler.
+* 📚 **Libreria Standard e GUI Toolkit (antem_libc):** Le applicazioni in Ring 3 sono supportate da una potente libreria C proprietaria scritta da zero. L'ecosistema è stato arricchito da un C Runtime Bootstrapper (crt0) per l'avvio e la terminazione sicura dei processi, e da un gestore dell'Heap in User Space espanso a 1.8 MB (malloc/free). Il pacchetto include funzioni di formattazione avanzata (printf variadica), un gestore unificato per il File I/O basato su stream (fopen, fread, fwrite con buffering interno) e, soprattutto, un GUI Toolkit nativo (Retained Mode). Quest'ultimo fornisce astrazioni ad alto livello per renderizzare dinamicamente bottoni, caselle di testo interattive, impaginazione del testo e immagini a 32-bit direttamente sul Window Manager tramite l'Interrupt 0x80.
 
 ---
 
@@ -35,34 +39,17 @@ Attualmente il sistema è distribuito sotto forma di file binari pronti per esse
 3. Apri un terminale nella cartella di estrazione e lancia questo comando (varia in base al sistema operativo utilizzato):
 
 ```bash
-qemu-system-i386 -kernel Ante-M.bin -drive file=disk.img,format=raw,index=0,media=disk -m 32M
+qemu-system-i386 -kernel myos.bin -drive file=disk.img,format=raw,index=0,media=disk -m 512M -device ac97
 ```
 
-> **Nota Tecnica:** Il parametro `-m 32M` è strettamente necessario. Il Kernel mappa le sue strutture dati e lo spazio di Heap allocabile richiedendo matematicamente almeno 32 Megabyte di RAM per un'esecuzione sicura.
+> **Nota Tecnica:** Il parametro `-m 512M` è la RAM, `-device ac97` specifica a QEMU riguarda l'audio.
 
 ---
 
 ## ⌨️ Comandi Terminale Disponibili
 
-Il Terminale integrato permette di interagire direttamente con il Kernel e il File System gerarchico. Digita `help` per una lista rapida:
+Il Terminale integrato permette di interagire direttamente con il Kernel e il File System. Digita `help` per una lista rapida:
 
-### File System (Gerarchico)
-* `ls [path]` : Elenca file e directory esplorando i percorsi.
-* `mkdir [path]` : Crea una nuova cartella nel percorso specificato.
-* `cat [path]` : Legge il contenuto di un file.
-* `create [p][t]` : Crea file testuali con il contenuto specificato.
-* `rm [path]` : Elimina file in modo sicuro (non le cartelle).
-* `fsinfo` : Statistiche disco Ext2 leggendo il Superblocco.
-
-### Sistema e Multitasking
-* `run [app]` : Lancia eseguibile .edxi o .bin risolvendone il percorso in automatico.
-* `ps` : Lista processi attivi, mostrando PID, ID Finestra e stato (RUN/SLEEP).
-* `kill [PID]` : Termina un processo e libera la sua RAM.
-* `meminfo` : Mostra lo stato dell'Heap e della RAM Kernel eseguendo test di allocazione.
-* `time` : Legge data e ora dal chip hardware CMOS.
-* `info` / `clear` : Info sistema / Pulisce il terminale.
-
----
 
 ## 👨‍💻 L'Autore
 
@@ -76,11 +63,7 @@ Sul web, la sua identità digitale è storicamente legata al numero **511** (da 
 
 ## ⚖️ Licenza (Freeware)
 
-Questo software è concesso in licenza d'uso gratuita, non venduto. Copyright (c) 2026 Alberto Sanfelice (511break). Tutti i diritti riservati.
+Questo progetto è rilasciato sotto la licenza GNU General Public License v2.0.
+*Copyright (c) 2026 Alberto Sanfelice (511break).*
 
-Il sistema operativo è gratuito per qualsiasi uso personale o educativo. Sei libero di copiare, distribuire e condividere i file binari, purché il software venga offerto gratuitamente e l'autore originale venga sempre citato chiaramente.
-Contrariamente ai classici software proprietari, **l'autore incoraggia la curiosità tecnica:** sei esplicitamente autorizzato (e incoraggiato) a disassemblare, retro-ingegnerizzare o studiare i file binari per scopi didattici.
-
-*Al momento, il codice sorgente originale in C e Assembly non è pubblico.*
-
-> **Disclaimer:** Questo sistema operativo è un progetto sperimentale ("bare-metal") fornito "COSÌ COM'È", senza alcuna garanzia esplicita o implicita. Per i dettagli completi, leggi il file `LICENSE.TXT` incluso nella release.
+> **Disclaimer:** Questo sistema operativo è un progetto sperimentale fornito "COSÌ COM'È", senza alcuna garanzia esplicita o implicita. Per i dettagli completi, leggi il file `LICENSE.TXT` incluso nella release.
