@@ -14,7 +14,7 @@
 Nasce come progetto di esplorazione tecnica per ricreare le complesse architetture dei sistemi operativi classici (tra cui Multitasking Preemptive, Demand Paging, Virtual File System Ext2 e Moduli Kernel Caricabili), unita a un'interfaccia grafica nativa ("Retained Mode") ispirata all'estetica iconica degli anni '90 e dei primi anni 2000. Il sistema è un ecosistema totalmente autosufficiente: non si appoggia ad alcuna libreria standard o codice di terze parti, comunica direttamente con l'hardware e include un proprio SDK (la libreria antem_libc) per lo sviluppo e la compilazione di applicazioni User-Space nel formato proprietario .edxi.
 
 
-<img width="1024" height="769" alt="Screenshot 2026-03-30 alle 22 48 59" src="https://github.com/user-attachments/assets/8e9c03fd-b8dc-4493-a33b-61e67edc0e11" />
+![Screenshot 2026-03-30 alle 22 48 59](https://github.com/user-attachments/assets/2f843118-85ae-4213-a04b-2f79a7a572f4)
 
 
 ---
@@ -55,7 +55,7 @@ Il Terminale integrato permette di interagire direttamente con il Kernel e il Fi
 
 Il creatore e sviluppatore principale di Ante-Millennium OS è **Alberto Sanfelice**.
 
-Sul web, la sua identità digitale è storicamente legata al numero **511** (da cui deriva l'estensione proprietaria degli eseguibili di sistema, `.edxi`). 
+Sul web, la sua identità digitale è storicamente legata al numero **511** (da cui deriva l'estensione proprietaria degli eseguibili di sistema, `.edxi`, dove "e" sta per executable, mentre "dxi" è il numero romano 511). 
 
 📹 **Canale YouTube Ufficiale:** [511break](https://www.youtube.com/@511break) - *Segui i "dietro le quinte" e lo sviluppo del codice.*
 
