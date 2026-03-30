@@ -61,7 +61,7 @@ Sul web, la sua identità digitale è storicamente legata al numero **511** (da 
 
 ---
 
-## ⚖️ Licenza (Freeware)
+## ⚖️ Licenza
 
 Questo progetto è rilasciato sotto la licenza GNU General Public License v2.0.
 *Copyright (c) 2026 Alberto Sanfelice (511break).*
