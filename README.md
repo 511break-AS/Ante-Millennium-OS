@@ -4,8 +4,6 @@
 ![Architecture](https://img.shields.io/badge/arch-x86_32--bit-red.svg)
 ![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)
 
-**PAGINA IN AGGIORNAMENTO - è in corso il rilascio della build 85 del sistema.**
-
 <img width="870" height="616" alt="FLAT_BIANCO_NUOVISSIMO_TESTO_LOGO_DEFINITIVO_ANTE_M" src="https://github.com/user-attachments/assets/3dd02963-0615-4d2e-be62-85f315b9cc59" />
 
 
@@ -15,7 +13,6 @@ Nasce come progetto di esplorazione tecnica per ricreare le complesse architettu
 
 
 ![Screenshot 2026-03-30 alle 22 48 59](https://github.com/user-attachments/assets/2f843118-85ae-4213-a04b-2f79a7a572f4)
-
 
 ---
 
