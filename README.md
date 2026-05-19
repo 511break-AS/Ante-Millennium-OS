@@ -1,4 +1,5 @@
 # 💿 Ante-Millennium OS (Ante-M) x86
+## [Aggiornamento build 110 nei prossimi giorni] 
 
 ![Version](https://img.shields.io/badge/version-0.1_Alpha-blue.svg)
 ![Architecture](https://img.shields.io/badge/arch-x86_32--bit-red.svg)
