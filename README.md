@@ -37,7 +37,7 @@ Attualmente il sistema è distribuito sotto forma di file binari pronti per esse
 3. Apri un terminale nella cartella di estrazione e lancia questo comando (varia in base al sistema operativo utilizzato):
 
 ```bash
-qemu-system-i386 -kernel Ante-M.bin -drive file=disk.img,format=raw,index=0,media=disk -m 512M -device ac97
+qemu-system-i386 -kernel myos.bin -drive file=disk.img,format=raw,index=0,media=disk -m 512M -device ac97
 ```
 
 > **Nota Tecnica:** Il parametro `-m 512M` è la RAM, `-device ac97` specifica a QEMU riguarda l'audio.
@@ -46,7 +46,7 @@ qemu-system-i386 -kernel Ante-M.bin -drive file=disk.img,format=raw,index=0,medi
 
 ## ⌨️ Comandi Terminale Disponibili
 
-Il Terminale integrato permette di interagire direttamente con il Kernel e il File System. Digita `help` per una lista rapida:
+Il Terminale integrato permette di interagire direttamente con il Kernel e il File System. Digita `help` nel terminale per una lista rapida.
 
 
 ## 👨‍💻 L'Autore
