@@ -18,7 +18,7 @@ Nasce come progetto di esplorazione tecnica per ricreare le complesse architettu
 
 ---
 
-## ✨ Architettura e Novità della Build 85 0.1 Alpha
+## ✨ Architettura e Novità della Build Alpha
 
 L'ultima evoluzione del sistema introduce cambiamenti strutturali profondi, implementando concetti avanzati di Ingegneria dei Sistemi Operativi:
 
