@@ -1,0 +1,8311 @@
+// Ante-Millennium Operating System
+// Copyright (C) 2026  Alberto Sanfelice
+
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; version 2
+// of the License.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, see
+// <https://www.gnu.org/licenses/>.
+
+// COMPILAZIONE e AVVIO
+// i686-elf-as boot.S -o boot.o
+// i686-elf-gcc -c kernel.c -o kernel.o -std=gnu99 -ffreestanding -O2 -Wall -Wextra
+// i686-elf-gcc -T linker.ld -o myos.bin -ffreestanding -O2 -nostdlib boot.o kernel.o -lgcc
+// qemu-system-i386 -kernel myos.bin -drive file=disk.img,format=raw,index=0,media=disk -m 512M -device ac97
+
+#include <stdint.h>
+#include <stddef.h>
+
+
+// ==========================================
+// FORWARD DECLARATIONS (Prototipi di base)
+// ==========================================
+void print_term(const char* msg);
+void* kmalloc(size_t size);
+void kfree(void* ptr);
+// --- FIRME PER IL DRIVER AUDIO ---
+void* kmalloc_dma(size_t size);
+int ext2_read_file(const char* full_path, char* dest_buffer, int max_size, uint32_t* out_file_size);
+void kfree_dma(void* ptr);
+void sleep(uint32_t ms);
+
+
+// DEFINIZIONI COLORI STANDARD
+#define COLOR_SKY_BLUE 0xFFC0C0C0  // C'è scritto skyblue ma in realtà è grigio. (c'è nebbia al nord!)
+
+
+// --- VARIABILI GLOBALI PER LA BOOTSCREEN ---
+char* bootscreen_logo_raw = 0;  // L'immagine grezza caricata dal disco
+uint32_t bootscreen_logo_w = 0; // Larghezza
+uint32_t bootscreen_logo_h = 0; // Altezza
+uint32_t bootscreen_pixel_offset = 0; // Offset dei pixel
+
+
+// ==========================================
+// MMU E MEMORIA VIRTUALE (PAGING)
+// ==========================================
+uint32_t page_directory[1024] __attribute__((aligned(4096)));
+
+
+void init_paging() {
+    // 1. Abilitiamo le pagine (4MB) per l'Identity Mapping del Kernel (PSE)
+    uint32_t cr4; asm volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= 0x00000010; asm volatile("mov %0, %%cr4" :: "r"(cr4));
+
+    // 2. Identity Map: I primi 4 GigaByte Fisici restano accessibili normalmente dal Kernel
+    for(uint32_t i = 0; i < 1024; i++) {
+        page_directory[i] = (i * 0x400000U) | 0x83; // Present, R/W, 4MB Page
+    }
+
+    // 3. Carichiamo la Directory e accendiamo la Memoria Virtuale!
+    asm volatile("mov %0, %%cr3":: "r"(page_directory));
+    uint32_t cr0; asm volatile("mov %%cr0, %0": "=r"(cr0));
+    cr0 |= 0x80000000; asm volatile("mov %0, %%cr0":: "r"(cr0));
+}
+
+// ==========================================
+// INFORMAZIONI HARDWARE DISCO FISSO
+// ==========================================
+uint32_t ata_drive_capacity_sectors = 0;
+uint32_t ata_drive_capacity_mb = 0;
+char ata_drive_model[41];
+
+
+// ==========================================
+// INFORMAZIONI MOUNT EXT2 (Mappa Block Groups)
+// ==========================================
+uint32_t ext2_blocks_per_group = 0;
+uint32_t ext2_inodes_per_group = 0;
+uint32_t ext2_total_groups = 0;
+uint32_t ext2_bgdt_lba = 4; // LBA della Block Group Descriptor Table
+
+
+// ==========================================
+// I/O HARDWARE
+// ==========================================
+static inline void outb(uint16_t port, uint8_t val) { asm volatile ( "outb %0, %1" : : "a"(val), "Nd"(port) ); }
+static inline uint8_t inb(uint16_t port) { uint8_t ret; asm volatile ( "inb %1, %0" : "=a"(ret) : "Nd"(port) ); return ret; }
+static inline void outw(uint16_t port, uint16_t val) { asm volatile ( "outw %0, %1" : : "a"(val), "Nd"(port) ); }
+// Legge 16 bit (una Word) da una porta
+static inline uint16_t inw(uint16_t port) {
+    uint16_t ret;
+    asm volatile ( "inw %1, %0" : "=a"(ret) : "Nd"(port) );
+    return ret;
+}
+
+static inline void outl(uint16_t port, uint32_t val) { asm volatile ( "outl %0, %1" : : "a"(val), "Nd"(port) ); }
+static inline uint32_t inl(uint16_t port) { uint32_t ret; asm volatile ( "inl %1, %0" : "=a"(ret) : "Nd"(port) ); return ret; }
+
+
+// --- HOOK DEL DRIVER AUDIO GLOBALE ---
+int (*sys_audio_play)(const char* path) = 0; // Inizialmente nullo
+
+void register_audio_driver(void* play_func_ptr) {
+    // Il driver ci passa la sua funzione, noi la salviamo nel Kernel
+    sys_audio_play = (int (*)(const char*))play_func_ptr;
+}
+
+
+// ==========================================
+// KERNEL API TABLE (Per i Driver)
+// ==========================================
+// Questa struttura è il "dizionario" che passeremo ai driver esterni.
+typedef struct {
+    void (*print_term)(const char*);
+    void* (*kmalloc)(size_t);
+    void (*kfree)(void*);
+    void (*outb)(uint16_t, uint8_t);
+    uint8_t (*inb)(uint16_t);
+    void (*outw)(uint16_t, uint16_t);
+    uint16_t (*inw)(uint16_t);
+    void* (*kmalloc_dma)(size_t);
+    int (*ext2_read_file)(const char*, char*, int, uint32_t*);
+    void (*kfree_dma)(void*);
+    void (*register_audio)(void*);
+} kernel_api_t;
+
+kernel_api_t driver_api;
+
+// Riempiamo il dizionario con gli indirizzi REALI delle funzioni del Kernel
+void init_driver_api() {
+    driver_api.print_term = print_term;
+    driver_api.kmalloc = kmalloc;
+    driver_api.kfree = kfree;
+    driver_api.outb = outb;
+    driver_api.inb = inb;
+    driver_api.outw = outw;
+    driver_api.inw = inw;
+    driver_api.kmalloc_dma = kmalloc_dma;
+    driver_api.ext2_read_file = ext2_read_file;
+    driver_api.kfree_dma = kfree_dma;
+    driver_api.register_audio = register_audio_driver;
+}
+
+// ==========================================
+// API MOUSE (Per Syscall 5)
+// ==========================================
+typedef struct {
+    int x;       // Posizione X relativa alla finestra dell'App
+    int y;       // Posizione Y relativa alla finestra dell'App
+    int clicked; // 1 se il tasto sinistro è premuto, 0 altrimenti
+    int win_id;  // Diciamo all'app QUALE finestra ha ricevuto il click
+} mouse_state_t;
+
+// ==========================================
+// API GRAFICA (Per Syscall 7)
+// ==========================================
+typedef struct {
+    int type;        // 0 = Pulisci tutto, 1 = Rettangolo, 2 = Bottone 3D, 3 = Testo
+    int x, y, w, h;  // Posizione e dimensioni relative alla finestra
+    uint32_t color1; // Colore di sfondo (o del testo se type=3)
+    uint32_t color2; // Colore del testo sul bottone
+    char text[256];   // Testo
+} gui_element_t;
+
+// ==========================================
+// SCHEDA VIDEO BGA E GRAFICA
+// ==========================================
+uint32_t* fb = (uint32_t*)0xFD000000;
+int fb_width = 1024;
+int fb_height = 768;
+
+// IL DOUBLE BUFFER (Tela nascosta in RAM)
+uint32_t backbuffer[1024 * 768];
+
+// ==========================================
+// FONT A MATRICE (8x8)
+// ==========================================
+const uint8_t font8x8_A_Z[26][8] = {
+    {0x18,0x3C,0x66,0x7E,0x66,0x66,0x66,0x00}, // A
+    {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0x00}, // B
+    {0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0x00}, // C
+    {0x78,0x6C,0x66,0x66,0x66,0x6C,0x78,0x00}, // D
+    {0x7E,0x60,0x60,0x78,0x60,0x60,0x7E,0x00}, // E
+    {0x7E,0x60,0x60,0x78,0x60,0x60,0x60,0x00}, // F
+    {0x3C,0x66,0x60,0x6E,0x66,0x66,0x3E,0x00}, // G
+    {0x66,0x66,0x66,0x7E,0x66,0x66,0x66,0x00}, // H
+    {0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0x00}, // I
+    {0x1E,0x0C,0x0C,0x0C,0x0C,0x6C,0x38,0x00}, // J
+    {0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0x00}, // K
+    {0x60,0x60,0x60,0x60,0x60,0x60,0x7E,0x00}, // L
+    {0x63,0x77,0x7F,0x6B,0x63,0x63,0x63,0x00}, // M
+    {0x66,0x76,0x7E,0x7E,0x6E,0x66,0x66,0x00}, // N
+    {0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00}, // O
+    {0x7C,0x66,0x66,0x7C,0x60,0x60,0x60,0x00}, // P
+    {0x3C,0x66,0x66,0x66,0x6A,0x6C,0x36,0x00}, // Q
+    {0x7C,0x66,0x66,0x7C,0x6C,0x66,0x66,0x00}, // R
+    {0x3C,0x66,0x60,0x3C,0x06,0x66,0x3C,0x00}, // S
+    {0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0x00}, // T
+    {0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0x00}, // U
+    {0x66,0x66,0x66,0x66,0x66,0x3C,0x18,0x00}, // V
+    {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00}, // W
+    {0x66,0x66,0x3C,0x18,0x3C,0x66,0x66,0x00}, // X
+    {0x66,0x66,0x66,0x3C,0x18,0x18,0x18,0x00}, // Y
+    {0x7E,0x06,0x0C,0x18,0x30,0x60,0x7E,0x00}  // Z
+};
+
+// ==========================================
+// FONT PROPORZIONALE GUI AD ALTA RISOLUZIONE (Altezza 16px NATIVA)
+// ==========================================
+typedef struct {
+    uint8_t width;        // Larghezza in pixel
+    uint8_t glyph[16];    
+} prop_char_t;
+
+// L'Array del Font Proporzionale NATIVO 16px 
+prop_char_t font_prop[128] = {
+    {0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},
+    {0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},{0,{0}},
+    {4, {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}}, // Spazio
+    {2, {0,0,0,0,0,0x80,0x80,0x80,0x80,0x80,0x80,0x00,0x80,0,0,0}}, // ! 
+    {4, {0,0,0,0,0,0xA0,0xA0,0xA0,0x00,0,0,0,0,0,0,0}}, // "
+    {6, {0,0,0,0,0,0x28,0x28,0xFC,0x28,0x28,0xFC,0x28,0x28,0,0,0}}, // #
+    {5, {0,0,0,0,0,0x20,0x78,0xA0,0xA0,0x70,0x28,0xF0,0x20,0,0,0}}, // $
+    {6, {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}}, // % 
+    {6, {0,0,0,0,0,0x40,0xA0,0xA0,0x40,0xA8,0x90,0x88,0x70,0,0,0}}, // &
+    {2, {0,0,0,0,0,0x80,0x80,0x80,0,0,0,0,0,0,0,0}}, // '
+    {3, {0,0,0,0,0,0x40,0x80,0x80,0x80,0x80,0x80,0x80,0x40,0,0,0}}, // (
+    {3, {0,0,0,0,0,0x80,0x40,0x40,0x40,0x40,0x40,0x40,0x80,0,0,0}}, // )
+    {5, {0,0,0,0,0,0,0x20,0xA8,0x70,0xA8,0x20,0,0,0,0,0}}, // *
+    {5, {0,0,0,0,0,0,0,0x20,0x20,0xF8,0x20,0x20,0,0,0,0}}, // +
+    {2, {0,0,0,0,0,0,0,0,0,0,0,0,0x40,0x40,0x80,0}}, // , 
+    {4, {0,0,0,0,0,0,0,0,0xF0,0,0,0,0,0,0,0}}, // -
+    {2, {0,0,0,0,0,0,0,0,0,0,0,0,0x40,0x40,0,0}}, // . 
+    {4, {0,0,0,0,0,0x10,0x10,0x20,0x20,0x40,0x40,0x80,0x80,0,0,0}}, // /
+    {5, {0,0,0,0,0,0x70,0x88,0x88,0x88,0x88,0x88,0x88,0x70,0,0,0}}, // 0
+    {4, {0,0,0,0,0,0x40,0xC0,0x40,0x40,0x40,0x40,0x40,0xE0,0,0,0}}, // 1
+    {5, {0,0,0,0,0,0x70,0x88,0x08,0x08,0x10,0x20,0x40,0xF8,0,0,0}}, // 2
+    {5, {0,0,0,0,0,0x70,0x88,0x08,0x08,0x30,0x08,0x88,0x70,0,0,0}}, // 3
+    {5, {0,0,0,0,0,0x10,0x30,0x50,0x90,0x90,0xF8,0x10,0x10,0,0,0}}, // 4
+    {5, {0,0,0,0,0,0xF8,0x80,0x80,0xF0,0x08,0x08,0x88,0x70,0,0,0}}, // 5
+    {5, {0,0,0,0,0,0x30,0x40,0x80,0x80,0xF0,0x88,0x88,0x70,0,0,0}}, // 6
+    {5, {0,0,0,0,0,0xF8,0x08,0x08,0x10,0x20,0x20,0x40,0x40,0,0,0}}, // 7
+    {5, {0,0,0,0,0,0x70,0x88,0x88,0x70,0x88,0x88,0x88,0x70,0,0,0}}, // 8 
+    {5, {0,0,0,0,0,0x70,0x88,0x88,0x88,0x78,0x08,0x10,0x60,0,0,0}}, // 9
+    {2, {0,0,0,0,0,0,0,0x40,0x40,0,0,0x40,0x40,0,0,0}}, // : 
+    {2, {0,0,0,0,0,0,0,0x40,0x40,0,0,0x40,0x40,0x80,0,0}}, // ; 
+    {4, {0,0,0,0,0,0,0x10,0x20,0x40,0x80,0x40,0x20,0x10,0,0,0}}, // <
+    {5, {0,0,0,0,0,0,0,0xF8,0,0,0xF8,0,0,0,0,0}}, // =
+    {4, {0,0,0,0,0,0,0x80,0x40,0x20,0x10,0x20,0x40,0x80,0,0,0}}, // >
+    {5, {0,0,0,0,0,0x70,0x88,0x08,0x10,0x20,0x20,0x00,0x20,0,0,0}}, // ? 
+    {7, {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}}, // @ 
+    {6, {0,0,0,0,0,0x20,0x50,0x88,0x88,0xF8,0x88,0x88,0x88,0,0,0}}, // A
+    {6, {0,0,0,0,0,0xF0,0x88,0x88,0xF0,0x88,0x88,0x88,0xF0,0,0,0}}, // B
+    {6, {0,0,0,0,0,0x70,0x88,0x80,0x80,0x80,0x80,0x88,0x70,0,0,0}}, // C
+    {6, {0,0,0,0,0,0xF0,0x88,0x88,0x88,0x88,0x88,0x88,0xF0,0,0,0}}, // D
+    {5, {0,0,0,0,0,0xF8,0x80,0x80,0xF0,0x80,0x80,0x80,0xF8,0,0,0}}, // E
+    {5, {0,0,0,0,0,0xF8,0x80,0x80,0xF0,0x80,0x80,0x80,0x80,0,0,0}}, // F
+    {6, {0,0,0,0,0,0x70,0x88,0x80,0x80,0x98,0x88,0x88,0x70,0,0,0}}, // G
+    {6, {0,0,0,0,0,0x88,0x88,0x88,0xF8,0x88,0x88,0x88,0x88,0,0,0}}, // H
+    {3, {0,0,0,0,0,0xE0,0x40,0x40,0x40,0x40,0x40,0x40,0xE0,0,0,0}}, // I
+    {5, {0,0,0,0,0,0x38,0x10,0x10,0x10,0x10,0x10,0x90,0x60,0,0,0}}, // J
+    {6, {0,0,0,0,0,0x88,0x90,0xA0,0xC0,0xA0,0x90,0x88,0x88,0,0,0}}, // K
+    {5, {0,0,0,0,0,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0xF8,0,0,0}}, // L
+    {7, {0,0,0,0,0,0x82,0xC6,0xAA,0x92,0x82,0x82,0x82,0x82,0,0,0}}, // M
+    {6, {0,0,0,0,0,0x88,0xC8,0xA8,0xA8,0x98,0x98,0x88,0x88,0,0,0}}, // N
+    {6, {0,0,0,0,0,0x70,0x88,0x88,0x88,0x88,0x88,0x88,0x70,0,0,0}}, // O
+    {6, {0,0,0,0,0,0xF0,0x88,0x88,0xF0,0x80,0x80,0x80,0x80,0,0,0}}, // P
+    {6, {0,0,0,0,0,0x70,0x88,0x88,0x88,0x88,0xA8,0x90,0x68,0,0,0}}, // Q
+    {6, {0,0,0,0,0,0xF0,0x88,0x88,0xF0,0xA0,0x90,0x88,0x88,0,0,0}}, // R
+    {6, {0,0,0,0,0,0x70,0x88,0x80,0x70,0x08,0x08,0x88,0x70,0,0,0}}, // S
+    {5, {0,0,0,0,0,0xF8,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0,0,0}}, // T
+    {6, {0,0,0,0,0,0x88,0x88,0x88,0x88,0x88,0x88,0x88,0x70,0,0,0}}, // U
+    {6, {0,0,0,0,0,0x88,0x88,0x88,0x88,0x50,0x50,0x50,0x20,0,0,0}}, // V
+    {7, {0,0,0,0,0,0x82,0x82,0x82,0x82,0x92,0xAA,0xC6,0x82,0,0,0}}, // W
+    {6, {0,0,0,0,0,0x88,0x88,0x50,0x20,0x50,0x88,0x88,0x88,0,0,0}}, // X
+    {6, {0,0,0,0,0,0x88,0x88,0x50,0x20,0x20,0x20,0x20,0x20,0,0,0}}, // Y
+    {6, {0,0,0,0,0,0xF8,0x08,0x10,0x20,0x40,0x40,0x80,0xF8,0,0,0}}, // Z
+    {3, {0,0,0,0,0,0xC0,0x80,0x80,0x80,0x80,0x80,0x80,0xC0,0,0,0}}, // [
+    {4, {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}}, // Backslash 
+    {3, {0,0,0,0,0,0xC0,0x40,0x40,0x40,0x40,0x40,0x40,0xC0,0,0,0}}, // ]
+    {5, {0,0,0,0,0,0x20,0x50,0x88,0,0,0,0,0,0,0,0}}, // ^
+    {5, {0,0,0,0,0,0,0,0,0,0,0,0,0,0xF8,0,0}}, // _
+    {3, {0,0,0,0,0,0x80,0x40,0,0,0,0,0,0,0,0,0}}, // `
+    // Minuscole (Iniziano più in basso, riga 7)
+    {5, {0,0,0,0,0,0,0,0x70,0x08,0x78,0x88,0x88,0x78,0,0,0}}, // a
+    {5, {0,0,0,0x80,0x80,0x80,0x80,0xB0,0xC8,0x88,0x88,0xC8,0xB0,0,0,0}}, // b
+    {5, {0,0,0,0,0,0,0,0x70,0x88,0x80,0x80,0x88,0x70,0,0,0}}, // c
+    {5, {0,0,0,0x08,0x08,0x08,0x08,0x68,0x98,0x88,0x88,0x98,0x68,0,0,0}}, // d
+    {5, {0,0,0,0,0,0,0,0x70,0x88,0xF8,0x80,0x88,0x70,0,0,0}}, // e
+    {4, {0,0,0,0x30,0x40,0x40,0xE0,0x40,0x40,0x40,0x40,0x40,0x40,0,0,0}}, // f
+    {5, {0,0,0,0,0,0,0,0x78,0x88,0x88,0x88,0x78,0x08,0x88,0x70,0}}, // g 
+    {5, {0,0,0,0x80,0x80,0x80,0x80,0xB0,0xC8,0x88,0x88,0x88,0x88,0,0,0}}, // h
+    {2, {0,0,0,0x80,0x80,0,0,0x80,0x80,0x80,0x80,0x80,0x80,0,0,0}}, // i
+    {3, {0,0,0,0x40,0x40,0,0,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x80,0}}, // j 
+    {5, {0,0,0,0x80,0x80,0x80,0x80,0x88,0x90,0xE0,0x90,0x88,0x88,0,0,0}}, // k
+    {2, {0,0,0,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0,0,0}}, // l
+    {7, {0,0,0,0,0,0,0,0xEC,0x92,0x92,0x92,0x92,0x92,0,0,0}}, // m
+    {5, {0,0,0,0,0,0,0,0xB0,0xC8,0x88,0x88,0x88,0x88,0,0,0}}, // n
+    {5, {0,0,0,0,0,0,0,0x70,0x88,0x88,0x88,0x88,0x70,0,0,0}}, // o
+    {5, {0,0,0,0,0,0,0,0xB0,0xC8,0x88,0x88,0xC8,0xB0,0x80,0x80,0}}, // p 
+    {5, {0,0,0,0,0,0,0,0x68,0x98,0x88,0x88,0x98,0x68,0x08,0x08,0}}, // q 
+    {4, {0,0,0,0,0,0,0,0xB0,0xC0,0x80,0x80,0x80,0x80,0,0,0}}, // r
+    {5, {0,0,0,0,0,0,0,0x78,0x80,0x80,0x70,0x08,0xF0,0,0,0}}, // s
+    {4, {0,0,0,0x40,0x40,0x40,0xE0,0x40,0x40,0x40,0x40,0x40,0x30,0,0,0}}, // t
+    {5, {0,0,0,0,0,0,0,0x88,0x88,0x88,0x88,0x98,0x68,0,0,0}}, // u
+    {5, {0,0,0,0,0,0,0,0x88,0x88,0x88,0x50,0x50,0x20,0,0,0}}, // v
+    {7, {0,0,0,0,0,0,0,0x82,0x92,0x92,0x92,0xAA,0x44,0,0,0}}, // w
+    {5, {0,0,0,0,0,0,0,0x88,0x88,0x50,0x20,0x50,0x88,0,0,0}}, // x
+    {5, {0,0,0,0,0,0,0,0x88,0x88,0x88,0x88,0x78,0x08,0x88,0x70,0}}, // y 
+    {5, {0,0,0,0,0,0,0,0xF8,0x10,0x20,0x40,0x80,0xF8,0,0,0}}, // z
+    {4, {0,0,0,0,0,0x30,0x40,0x40,0x40,0x80,0x40,0x40,0x40,0x30,0,0}}, // {
+    {2, {0,0,0,0,0,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0,0}}, // |
+    {4, {0,0,0,0,0,0xC0,0x20,0x20,0x20,0x10,0x20,0x20,0x20,0xC0,0,0}}, // }
+    {6, {0,0,0,0,0,0,0,0,0x48,0xB4,0,0,0,0,0,0}}, // ~
+    {0, {0}}
+};
+
+
+// ==========================================
+// FONT MINUSCOLO "HIGH-LEGIBILITY" (a-z)
+// ==========================================
+const uint8_t font8x8_a_z[26][8] = {
+    {0x00,0x00,0x3C,0x06,0x3E,0x66,0x3B,0x00}, // a
+    {0x60,0x60,0x7C,0x66,0x66,0x66,0x7C,0x00}, // b
+    {0x00,0x00,0x3C,0x60,0x60,0x60,0x3C,0x00}, // c
+    {0x06,0x06,0x3E,0x66,0x66,0x66,0x3E,0x00}, // d
+    {0x00,0x00,0x3C,0x66,0x7E,0x60,0x3C,0x00}, // e
+    {0x1C,0x36,0x30,0x78,0x30,0x30,0x30,0x00}, // f
+    {0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x3C}, // g 
+    {0x60,0x60,0x7C,0x66,0x66,0x66,0x66,0x00}, // h
+    {0x18,0x18,0x00,0x38,0x18,0x18,0x3C,0x00}, // i 
+    {0x0C,0x0C,0x00,0x0C,0x0C,0x0C,0xCC,0x78}, // j 
+    {0x60,0x60,0x66,0x6C,0x78,0x6C,0x66,0x00}, // k
+    {0x38,0x18,0x18,0x18,0x18,0x18,0x3C,0x00}, // l
+    {0x00,0x00,0xEE,0xDB,0xDB,0xDB,0xDB,0x00}, // m 
+    {0x00,0x00,0x7C,0x66,0x66,0x66,0x66,0x00}, // n
+    {0x00,0x00,0x3C,0x66,0x66,0x66,0x3C,0x00}, // o
+    {0x00,0x00,0x7C,0x66,0x66,0x7C,0x60,0x60}, // p
+    {0x00,0x00,0x3E,0x66,0x66,0x3E,0x06,0x06}, // q
+    {0x00,0x00,0x7C,0x66,0x60,0x60,0x60,0x00}, // r
+    {0x00,0x00,0x3E,0x60,0x3C,0x06,0x7C,0x00}, // s
+    {0x30,0x30,0x78,0x30,0x30,0x30,0x1C,0x00}, // t
+    {0x00,0x00,0x66,0x66,0x66,0x66,0x3E,0x00}, // u
+    {0x00,0x00,0x66,0x66,0x66,0x3C,0x18,0x00}, // v
+    {0x00,0x00,0xDB,0xDB,0xDB,0xDB,0x77,0x00}, // w 
+    {0x00,0x00,0x66,0x3C,0x18,0x3C,0x66,0x00}, // x
+    {0x00,0x00,0x66,0x66,0x66,0x3E,0x06,0x3C}, // y
+    {0x00,0x00,0x7E,0x0C,0x18,0x30,0x7E,0x00}  // z
+};
+
+
+const uint8_t font8x8_numbers[10][8] = {
+    {0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00}, // 0
+    {0x18,0x38,0x18,0x18,0x18,0x18,0x3E,0x00}, // 1
+    {0x3C,0x66,0x06,0x1C,0x30,0x60,0x7E,0x00}, // 2
+    {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00}, // 3
+    {0x0C,0x1C,0x2C,0x4C,0x7E,0x0C,0x0C,0x00}, // 4
+    {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00}, // 5
+    {0x3C,0x60,0x7C,0x66,0x66,0x66,0x3C,0x00}, // 6
+    {0x7E,0x06,0x06,0x0C,0x18,0x18,0x18,0x00}, // 7
+    {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00}, // 8
+    {0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0x00}  // 9
+};
+
+const uint8_t font_space[8] = {0,0,0,0,0,0,0,0};
+
+char scancode_to_ascii[128] = {
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+  '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+    0,  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
+    0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
+    '*', 0, ' ', 0
+};
+
+// Componenti del terminale
+// ==========================================
+// VARIABILI GLOBALI
+// ==========================================
+#define TERM_MAX_ROWS 150
+#define TERM_VIS_ROWS 16
+#define TERM_COLS 150
+
+
+// ==========================================
+// VARIABILI PER LA MACCHINA A STATI (RMDIR)
+// ==========================================
+int pending_rmdir = 0;           // 1 se stiamo aspettando una risposta (y/n)
+char pending_rmdir_path[64];     // Salva il percorso da distruggere
+
+// ==========================================
+// VARIABILI GLOBALI PROGRESS BAR E VFS LOCK
+// ==========================================
+int show_progress_bar = 0;
+uint32_t progress_current = 0;
+uint32_t progress_total = 0;
+
+// IL LUCCHETTO DEL DISCO: 0 = Libero, 1 = Occupato
+volatile int vfs_lock = 0;
+
+
+// ==========================================
+// WINDOW MANAGER E GRAFICA GLOBALE
+// ==========================================
+int mouse_x = 0;
+int mouse_y = 0;
+int is_clicking = 0;
+int prev_clicking = 0; 
+
+// --- MOTORE DI ANIMAZIONE ASINCRONO (Linear Interpolation) ---
+volatile int anim_active = 0;
+volatile int anim_x = 0, anim_y = 0, anim_w = 0, anim_h = 0;
+volatile int anim_start_x = 0, anim_start_y = 0, anim_start_w = 0, anim_start_h = 0;
+volatile int anim_target_x = 0, anim_target_y = 0, anim_target_w = 0, anim_target_h = 0;
+volatile int anim_frames_total = 0;
+volatile int anim_frames_left = 0;
+volatile int taskbar_y_offset = 5;       // Offset attuale (5 = fluttuante, 0 = ancorata in basso)
+volatile int taskbar_target_offset = 5;  // Offset desiderato
+
+// Gestione Larghezza Dinamica della Taskbar
+volatile int taskbar_w = 220;            // Larghezza attuale animata (Parte compatta!)
+volatile int taskbar_target_w = 220;     // Larghezza desiderata calcolata
+
+#define MAX_WINDOWS 10
+#define WIN_TYPE_TERMINAL 1
+#define WIN_TYPE_SETTINGS 2 
+#define WIN_TYPE_START_MENU 3 // Menu
+#define WIN_TYPE_APP_GUI 4 // La tela vuota per le app EDXI
+#define WIN_TYPE_APP_MENU 5 // Sottomenu Applicazioni
+
+typedef struct {
+    int active;       
+    int type;         
+    char title[32];
+    char full_path[64]; // Percorso completo per la nuvoletta   
+    int x, y, w, h;
+    
+    // LIMITI DINAMICI DEL BOUNDING BOX
+    int min_w;
+    int min_h;
+    int base_w; // Memoria della larghezza iniziale/base richiesta dall'app
+    int base_h; // Memoria dell'altezza iniziale/base richiesta dall'app
+    
+    // CAMPI PER IL MASSIMIZZA
+    int is_maximized;
+    int is_minimized;
+    int prev_x, prev_y, prev_w, prev_h;
+
+    int creation_id;
+    int icon_id; // VARIABILE PER LE ICONE
+    int owner_pid; // Quale Processo possiede questa finestra? (0 = Kernel)
+
+    // RAM PRIVATA DI QUESTA FINESTRA
+    char t_history[TERM_MAX_ROWS][TERM_COLS];
+    char t_buffer[256];
+    int t_len;
+    int t_cursor;
+    int t_scroll;
+
+    // TELA GRAFICA DELL'APP
+    gui_element_t ui_elements[32]; // Può contenere fino a 32 bottoni/elementi grafici
+    int ui_count;
+    int is_initializing; // La finestra resta nascosta durante il primo setup
+
+    // CACHE SCROLLBAR
+    int t_max_scrl;
+    int t_thumb_y;
+    int t_thumb_h;
+    int t_head; 
+} window_t;
+
+window_t windows[MAX_WINDOWS];
+int window_order[MAX_WINDOWS]; 
+int global_active_win = -1; // Traccia chi ha il focus (colore blu e tastiera)
+int dragged_window = -1;
+int resizing_window = -1; // Ricorda chi stiamo ridimensionando
+int scrolling_window = -1; // Scrollbar trascinata
+int drag_offset_x = 0;
+int drag_offset_y = 0;
+int scroll_drag_offset_y = 0; // Offset del click sulla scrollbar
+int scroll_start_val = 0;     // Valore dello scroll al momento del click
+
+// VARIABILI PER LA LOGICA DEI BOTTONI
+int pressed_window_id = -1; // Finestra di cui stiamo premendo un bottone
+int pressed_window_btn = 0; // 0=Nessuno, 1=Chiudi, 2=Massimizza, 3=Minimizza
+int pressed_info_btn = 0;   // 1 = Stiamo tenendo premuto il tasto Info sulla Taskbar
+int active_tooltip_window = -1; // Quale finestra sta mostrando la nuvoletta gialla?
+
+// ==========================================
+// VARIABILI PER LE TEXTBOX E IL FOCUS
+// ==========================================
+int focused_window_id = -1;   // Quale finestra ha il Focus della tastiera?
+int focused_element_idx = -1; // Quale Textbox in quella finestra stiamo scrivendo?
+int focused_cursor_pos = 0;   // Ricorda in che punto esatto della frase ci troviamo
+int blink_counter = 0;        // Contatore per far lampeggiare il cursore '|'
+
+// ==========================================
+// MULTITASKING E SCHEDULER (PREPARAZIONE)
+// ==========================================
+
+#define MAX_PROCESSES 16
+
+typedef struct {
+    int active;             // 1 se il processo è vivo
+    uint32_t esp;           // L'indirizzo esatto a cui era arrivato
+    uint32_t stack_base;    // La memoria RAM privata (stack)
+    uint32_t* page_table;   // La Page Table privata dell'App
+    int linked_window;      // La finestra grafica a cui è ancorato
+    int parent_window;      // La finestra "madre" che l'ha lanciato
+
+    int waiting_for_input;
+    char* input_buffer;
+    int input_max;
+    int input_idx;
+
+    int is_critical_io;
+} process_t;
+
+process_t process_table[MAX_PROCESSES];
+int current_pid = 0;   // 0 = Il Kernel (Desktop), 1+ = Le Applicazioni
+
+
+
+// --- MOTORE DI CONTEXT SWITCHING E DIROTTAMENTO I/O ---
+int get_active_term() {
+    // Se a parlare è un'App, usa la sua finestra nativa...
+    if (current_pid > 0) {
+        int linked = process_table[current_pid].linked_window;
+        
+        // ...MA se è un'App GUI e ha un Terminale Genitore, dirotta l'I/O al genitore!
+        if (windows[linked].type == WIN_TYPE_APP_GUI && process_table[current_pid].parent_window != -1) {
+            return process_table[current_pid].parent_window;
+        }
+        
+        return linked;
+    }
+
+    // Se è il Kernel, usa la finestra correntemente in cima
+    for(int i=0; i<MAX_WINDOWS; i++) {
+        int w = window_order[i];
+        if(windows[w].active && windows[w].type == WIN_TYPE_TERMINAL) return w;
+    }
+    return 0;
+}
+
+// Qualsiasi riga di codice sotto questo punto che usa le parole
+// "term_buffer" o "term_len", verrà automaticamente dirottata dal compilatore 
+// sulla RAM privata della finestra attiva. Nessun refactoring necessario.
+#define term_history (windows[get_active_term()].t_history)
+#define term_buffer  (windows[get_active_term()].t_buffer)
+#define term_len     (windows[get_active_term()].t_len)
+#define term_cursor  (windows[get_active_term()].t_cursor)
+#define term_scroll  (windows[get_active_term()].t_scroll)
+
+
+// Questa funzione ora si limita a salvare la stringa GREZZA nello storico.
+// L'impaginazione dinamica la farà il motore grafico in tempo reale!
+void print_term(const char* msg) {
+    if (msg[0] == '\0') msg = " ";
+    int w = get_active_term();
+    int head = windows[w].t_head;
+
+    // 1. Scriviamo nella riga puntata da head (Niente più cicli di spostamento memorie!)
+    int c = 0;
+    while (msg[c] != '\0' && c < TERM_COLS - 1) {
+        if (msg[c] != '\n') windows[w].t_history[head][c] = msg[c]; 
+        else windows[w].t_history[head][c] = ' '; 
+        c++;
+    }
+    windows[w].t_history[head][c] = '\0';
+
+    // 2. Avanziamo l'indice in modo circolare
+    head++;
+    if (head >= TERM_MAX_ROWS) head = 0;
+    windows[w].t_head = head;
+
+    // 3. Puliamo la nuova riga (che ora è la più vecchia)
+    windows[w].t_history[head][0] = '\0';
+    windows[w].t_scroll = 0;
+}
+
+// Funzione per convertire un numero in una stringa di testo
+void itoa(uint32_t num, char* str) {
+    if (num == 0) { str[0] = '0'; str[1] = '\0'; return; }
+    int i = 0;
+    uint32_t temp = num;
+    while (temp > 0) { temp /= 10; i++; }
+    str[i] = '\0';
+    while (num > 0) {
+        str[--i] = (num % 10) + '0';
+        num /= 10;
+    }
+}
+
+void itoa_hex(uint32_t num, char* str) {
+    char hex_chars[] = "0123456789ABCDEF";
+    str[0] = '0'; str[1] = 'x';
+    if (num == 0) { str[2] = '0'; str[3] = '\0'; return; }
+    int i = 2;
+    uint32_t temp = num;
+    while (temp > 0) { temp >>= 4; i++; }
+    str[i] = '\0';
+    while (num > 0) {
+        str[--i] = hex_chars[num & 0x0F];
+        num >>= 4;
+    }
+}
+
+// ==========================================
+// FILE SYSTEM EXT2 (Le Fondamenta)
+// ==========================================
+// __attribute__((packed)): dice al compilatore C 
+// di non aggiungere byte vuoti di "spaziatura" nella struttura!
+typedef struct {
+    uint32_t s_inodes_count;      // Numero totale di Inode (quanti file e cartelle max)
+    uint32_t s_blocks_count;      // Numero totale di blocchi
+    uint32_t s_r_blocks_count;
+    uint32_t s_free_blocks_count; // Blocchi ancora liberi
+    uint32_t s_free_inodes_count; // Inode ancora liberi
+    uint32_t s_first_data_block;
+    uint32_t s_log_block_size;
+    uint32_t s_log_frag_size;
+    uint32_t s_blocks_per_group;
+    uint32_t s_frags_per_group;
+    uint32_t s_inodes_per_group;
+    uint32_t s_mtime;
+    uint32_t s_wtime;
+    uint16_t s_mnt_count;
+    uint16_t s_max_mnt_count;
+    uint16_t s_magic;             // Deve essere 0xEF53
+} __attribute__((packed)) ext2_superblock_t;
+
+// Il Descrittore del Gruppo (ci dice dove sono le tabelle)
+typedef struct {
+    uint32_t bg_block_bitmap;
+    uint32_t bg_inode_bitmap;
+    uint32_t bg_inode_table;      // Il blocco in cui iniziano gli Inode.
+    uint16_t bg_free_blocks_count;
+    uint16_t bg_free_inodes_count;
+    uint16_t bg_used_dirs_count;
+    uint16_t bg_pad;
+    uint32_t bg_reserved[3];
+} __attribute__((packed)) ext2_bg_desc_t;
+
+// L'Inode (La carta d'identità di un file o cartella)
+typedef struct {
+    uint16_t i_mode;        // Ci dice se è un file (0x8000) o una cartella (0x4000)
+    uint16_t i_uid;
+    uint32_t i_size;
+    uint32_t i_atime;
+    uint32_t i_ctime;
+    uint32_t i_mtime;
+    uint32_t i_dtime;
+    uint16_t i_gid;
+    uint16_t i_links_count;
+    uint32_t i_blocks;
+    uint32_t i_flags;
+    uint32_t i_osd1;
+    uint32_t i_block[15];         // L'array che contiene gli indirizzi dei dati.
+} __attribute__((packed)) ext2_inode_t;
+
+// La Directory Entry (Un singolo file dentro una cartella)
+typedef struct {
+    uint32_t inode;
+    uint16_t rec_len;             // Quanto è lunga l'intera entry (per saltare alla prossima)
+    uint8_t  name_len;            // Quanto è lungo il nome del file
+    uint8_t  file_type;
+    // Il nome del file inizia qui, ma ha lunghezza variabile
+} __attribute__((packed)) ext2_dir_entry_t;
+
+
+
+void init_graphics() {
+    uint16_t BGA_INDEX = 0x01CE, BGA_DATA  = 0x01CF;
+    outw(BGA_INDEX, 4); outw(BGA_DATA, 0);       
+    outw(BGA_INDEX, 1); outw(BGA_DATA, 1024);    
+    outw(BGA_INDEX, 2); outw(BGA_DATA, 768);     
+    outw(BGA_INDEX, 3); outw(BGA_DATA, 32);      
+    outw(BGA_INDEX, 4); outw(BGA_DATA, 0x41);    
+}
+
+void draw_pixel(int x, int y, uint32_t color) {
+    if (x >= 0 && x < fb_width && y >= 0 && y < fb_height) {
+        // Scriviamo nella RAM, non sulla scheda video
+        backbuffer[y * fb_width + x] = color;
+    }
+}
+// Copia l'intero quadro perfetto dalla RAM alla Scheda Video in un colpo solo
+void swap_buffers() {
+    for (int i = 0; i < fb_width * fb_height; i++) {
+        fb[i] = backbuffer[i];
+    }
+}
+
+void draw_rect(int start_x, int start_y, int width, int height, uint32_t color) {
+    // 1. Tagliamo i bordi fuori dallo schermo UNA SOLA VOLTA (Clipping)
+    int x0 = start_x; if (x0 < 0) x0 = 0;
+    int y0 = start_y; if (y0 < 0) y0 = 0;
+    int x1 = start_x + width; if (x1 > fb_width) x1 = fb_width;
+    int y1 = start_y + height; if (y1 > fb_height) y1 = fb_height;
+
+    // 2. Scrittura Diretta in RAM 
+    for (int y = y0; y < y1; y++) {
+        // Calcoliamo l'indirizzo di partenza della riga
+        uint32_t* row_ptr = &backbuffer[y * fb_width + x0];
+        
+        for (int x = x0; x < x1; x++) {
+            *row_ptr = color; // Coloriamo il pixel
+            row_ptr++;        // Passiamo al prossimo (operazione istantanea per la CPU)
+        }
+    }
+}
+
+
+
+
+
+// Disegna un pulsante "Effetto Vetro Aqua" (stile Mac OS X) SIGILLATO.  QUESTO NON e' MALE
+void draw_button(int x, int y, int width, int height, uint32_t bg_color, uint32_t light_color, uint32_t dark_color) {
+    
+    (void)light_color; // Trucco C: Silenzia il warning di GCC per questo parametro ormai obsoleto
+
+    // Estraiamo i canali RGB per la magia matematica
+    uint32_t br = (bg_color >> 16) & 0xFF;
+    uint32_t bg = (bg_color >> 8) & 0xFF;
+    uint32_t bb = bg_color & 0xFF;
+
+    int half_h = height / 2;
+
+    // 1. IL CORPO IN VETRO (Gradiente base + Glare)
+    for (int row = 2; row < height - 2; row++) {
+        uint32_t r, g, b, row_color;
+        
+        // A. GRADIENTE DI BASE (La lente)
+        if (row <= half_h) {
+            uint32_t darken = 15 - ((row * 15) / half_h); 
+            r = br - ((br * darken) / 100);
+            g = bg - ((bg * darken) / 100);
+            b = bb - ((bb * darken) / 100);
+        } else {
+            uint32_t lighten = (((row - half_h) * 45) / (height - half_h)); 
+            r = br + ((255 - br) * lighten / 100);
+            g = bg + ((255 - bg) * lighten / 100);
+            b = bb + ((255 - bb) * lighten / 100);
+        }
+        row_color = 0xFF000000 | (r << 16) | (g << 8) | b;
+        
+        // Disegniamo la riga di base
+        draw_rect(x + 2, y + row, width - 4, 1, row_color);
+
+        // B. IL RIFLESSO SUPERIORE (The Aqua Glare)
+        if (row <= half_h) {
+            uint32_t white_mix = 75 - ((row * 50) / half_h); 
+            uint32_t gr = r + ((255 - r) * white_mix / 100);
+            uint32_t gg = g + ((255 - g) * white_mix / 100);
+            uint32_t gb = b + ((255 - b) * white_mix / 100);
+            uint32_t glare_color = 0xFF000000 | (gr << 16) | (gg << 8) | gb;
+            
+            draw_rect(x + 3, y + row, width - 6, 1, glare_color);
+        }
+    }
+
+    // 2. Bordo Esterno Sottile (Incornicia il bottone)
+    uint32_t border_out = (((dark_color & 0x00FEFEFE) + (bg_color & 0x00FEFEFE)) >> 1);
+    draw_rect(x + 4, y, width - 8, 1, border_out);              // Top
+    draw_rect(x, y + 4, 1, height - 8, border_out);             // Left
+    draw_rect(x + 4, y + height - 1, width - 8, 1, dark_color); // Bottom
+    draw_rect(x + width - 1, y + 4, 1, height - 8, dark_color); // Right
+
+    // 3. RIFLESSI E OMBRE INTERNE (Dinamico e incondizionato)
+    // Calcoliamo SEMPRE un colore più chiaro (+60% verso il bianco) partendo dal colore base.
+    // Se il bottone è premuto, 'bg_color' è già più scuro, quindi il riflesso si oscurerà di conseguenza in perfetta armonia!
+    uint32_t il_r = br + ((255 - br) * 60 / 100);
+    uint32_t il_g = bg + ((255 - bg) * 60 / 100);
+    uint32_t il_b = bb + ((255 - bb) * 60 / 100);
+    uint32_t inner_light = 0xFF000000 | (il_r << 16) | (il_g << 8) | il_b;
+
+    draw_rect(x + 2, y + 1, width - 4, 1, inner_light);         // Riflesso Luce Alto
+    draw_rect(x + 1, y + 2, 1, height - 4, inner_light);        // Riflesso Luce Sinistro
+    draw_rect(x + 2, y + height - 2, width - 4, 1, dark_color); // Ombra interna basso
+    draw_rect(x + width - 2, y + 2, 1, height - 4, dark_color); // Ombra interna destra
+
+    // 4. ANTI-ALIASING SCOLPITO (Mantiene la forma morbida)
+    
+    // Top-Left Curve
+    draw_pixel(x + 2, y + 1, border_out); draw_pixel(x + 3, y + 1, border_out);
+    draw_pixel(x + 1, y + 2, border_out); draw_pixel(x + 1, y + 3, border_out);
+    draw_pixel(x + 2, y + 2, inner_light); 
+    
+    // Top-Right Curve
+    draw_pixel(x + width - 3, y + 1, border_out); draw_pixel(x + width - 4, y + 1, border_out);
+    draw_pixel(x + width - 2, y + 2, border_out); draw_pixel(x + width - 2, y + 3, border_out);
+    draw_pixel(x + width - 3, y + 2, inner_light);
+
+    // Bottom-Left Curve
+    draw_pixel(x + 1, y + height - 3, border_out); draw_pixel(x + 1, y + height - 4, border_out);
+    draw_pixel(x + 2, y + height - 2, dark_color); draw_pixel(x + 3, y + height - 2, dark_color);
+    draw_pixel(x + 2, y + height - 3, dark_color); 
+
+    // Bottom-Right Curve
+    draw_pixel(x + width - 2, y + height - 3, dark_color); draw_pixel(x + width - 2, y + height - 4, dark_color);
+    draw_pixel(x + width - 3, y + height - 2, dark_color); draw_pixel(x + width - 4, y + height - 2, dark_color);
+    draw_pixel(x + width - 3, y + height - 3, dark_color);
+}
+
+
+// ==============================================================================
+// NUOVO BITMAP LOGO: 4 Barre Verticali e 1 Quadrato.
+// Indici: 0 = Trasparente, 1 = Nero (Bordi), 2 = Ciano (Riempimento)
+// ==============================================================================
+const uint8_t os_logo_bitmap[16][24] = {
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, // Y=0 (Margine)
+    {1,1,0,1,1,0,1,1,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1,1}, // Y=1 (Top Nero)
+    {1,1,0,1,1,0,1,1,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1,1}, // Y=2 (Top Nero)
+    {3,3,0,3,3,0,3,3,0,3,3,0,1,1,2,2,2,2,2,2,2,2,1,1}, // Y=3 (Ciano Centrale)
+    {3,3,0,3,3,0,3,3,0,3,3,0,1,1,2,2,2,2,2,2,2,2,1,1}, // Y=4
+    {3,3,0,3,3,0,3,3,0,3,3,0,1,1,2,2,2,2,2,2,2,2,1,1}, // Y=5
+    {3,3,0,3,3,0,3,3,0,3,3,0,1,1,2,2,2,2,2,2,2,2,1,1}, // Y=6
+    {3,3,0,3,3,0,3,3,0,3,3,0,1,1,2,2,2,2,2,2,2,2,1,1}, // Y=7
+    {3,3,0,3,3,0,3,3,0,3,3,0,1,1,2,2,2,2,2,2,2,2,1,1}, // Y=8
+    {3,3,0,3,3,0,3,3,0,3,3,0,1,1,2,2,2,2,2,2,2,2,1,1}, // Y=9
+    {3,3,0,3,3,0,3,3,0,3,3,0,1,1,2,2,2,2,2,2,2,2,1,1}, // Y=10
+    {1,1,0,1,1,0,1,1,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1,1}, // Y=11 (Bottom Nero)
+    {1,1,0,1,1,0,1,1,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1,1}, // Y=12 (Bottom Nero)
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, // Y=13
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, // Y=14
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}  // Y=15
+};
+
+// logo os menu start
+void draw_os_logo(int start_x, int start_y) {
+    // Palette Piatta "Flat UI": Nero e Ciano Brillante
+    uint32_t palette[4] = {
+        0,          // 0: Trasparente
+        0xFF000000, // 1: Nero Puro (Bordi)
+        //0xFF00D1FF,  // 2: Ciano Neon (Colore interno)
+        //0xFF01A2FF   // 3. blu
+        0xFFE3C6AA, // 2: Colore Title Bar (Sabbia) - Per il corpo centrale
+        0xFFCFB298  // 3: Colore Linee (Sabbia Scuro) - Per le barre verticali
+    };
+    
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 24; x++) { 
+            uint8_t color_idx = os_logo_bitmap[y][x];
+            if (color_idx > 0) { 
+                draw_pixel(start_x + x, start_y + y, palette[color_idx]);
+            }
+        }
+    }
+}
+
+
+// Disegna una casella di testo "scavata" (Sunken 3D Morbido e Arrotondato)
+void draw_textfield(int x, int y, int width, int height, uint32_t bg_color) {
+    
+    // Colori fissi per la cornice scavata
+    uint32_t border_out = 0xFF808080;   // Bordo esterno principale (Ombra della finestra)
+    uint32_t shadow_in = 0xFF575757;    // Ombra interna scura (Il taglio netto)
+    uint32_t light_edge = 0xFFFFFFFF;   // Luce in basso a destra (Riflesso)
+
+    // 1. Sfondo Centrale (Margine di 2px per le curve)
+    draw_rect(x + 2, y + 2, width - 4, height - 4, bg_color);
+
+    // 2. Ombra interna sfumata in alto (Effetto profondità dinamica calcolata sul colore di sfondo)
+    uint32_t r = (bg_color >> 16) & 0xFF;
+    uint32_t g = (bg_color >> 8) & 0xFF;
+    uint32_t b = bg_color & 0xFF;
+    uint32_t s1 = 0xFF000000 | ((r * 85 / 100) << 16) | ((g * 85 / 100) << 8) | (b * 85 / 100);
+    uint32_t s2 = 0xFF000000 | ((r * 94 / 100) << 16) | ((g * 94 / 100) << 8) | (b * 94 / 100);
+    draw_rect(x + 2, y + 2, width - 4, 1, s1);
+    draw_rect(x + 2, y + 3, width - 4, 1, s2);
+
+    // 3. Bordi Esterni (Spessore 1px, accorciati per fare spazio alla curva)
+    draw_rect(x + 4, y, width - 8, 1, border_out);              // Top
+    draw_rect(x, y + 4, 1, height - 8, border_out);             // Left
+    draw_rect(x + 4, y + height - 1, width - 8, 1, light_edge); // Bottom
+    draw_rect(x + width - 1, y + 4, 1, height - 8, light_edge); // Right
+
+    // 4. Bordi Interni (Creano lo spessore scavato)
+    draw_rect(x + 4, y + 1, width - 8, 1, shadow_in);           // Inner Top
+    draw_rect(x + 1, y + 4, 1, height - 8, shadow_in);          // Inner Left
+    draw_rect(x + 4, y + height - 2, width - 8, 1, bg_color);   // Inner Bottom (Fuso col fondo)
+    draw_rect(x + width - 2, y + 4, 1, height - 8, bg_color);   // Inner Right (Fuso col fondo)
+
+    // 5. Curvatura Angoli (Raccordo perfetto a 4 pixel)
+    
+    // Top-Left (Doppia Ombra)
+    draw_pixel(x + 2, y + 1, border_out); draw_pixel(x + 3, y + 1, border_out);
+    draw_pixel(x + 1, y + 2, border_out); draw_pixel(x + 1, y + 3, border_out);
+    draw_pixel(x + 2, y + 2, shadow_in); draw_pixel(x + 3, y + 2, shadow_in); draw_pixel(x + 2, y + 3, shadow_in);
+
+    // Top-Right (Il bordo scuro gira l'angolo, il chiaro inizia dopo)
+    draw_pixel(x + width - 3, y + 1, border_out); draw_pixel(x + width - 4, y + 1, border_out);
+    draw_pixel(x + width - 2, y + 2, border_out); draw_pixel(x + width - 2, y + 3, border_out);
+    draw_pixel(x + width - 3, y + 2, shadow_in);
+
+    // Bottom-Left (Il bordo scuro gira l'angolo verso il basso)
+    draw_pixel(x + 1, y + height - 3, border_out); draw_pixel(x + 1, y + height - 4, border_out);
+    draw_pixel(x + 2, y + height - 2, border_out); draw_pixel(x + 3, y + height - 2, border_out);
+    draw_pixel(x + 2, y + height - 3, shadow_in);
+
+    // Bottom-Right (Doppia Luce)
+    draw_pixel(x + width - 2, y + height - 3, light_edge); draw_pixel(x + width - 2, y + height - 4, light_edge);
+    draw_pixel(x + width - 3, y + height - 2, light_edge); draw_pixel(x + width - 4, y + height - 2, light_edge);
+    draw_pixel(x + width - 3, y + height - 3, bg_color); // Il pixel interno si fonde dolcemente
+}
+
+
+
+void draw_window(int x, int y, int width, int height, int is_active) {
+    
+    (void)is_active; // Silenziamo il warning
+    
+    uint32_t bg_color = 0xFFC0C0C0; 
+    uint32_t border_tl = 0xFF454545; // Grigio Antracite (Luce in alto a sinistra)
+    uint32_t border_br = 0xFF000000; // Nero puro (Ombra in basso a destra)
+    uint32_t shadow = 0xFF808080;
+
+    // ========================================================================
+    // 1. Barra del Titolo ESTESA (Tematizzabile, ultra-compatta)
+    // ========================================================================
+    // Questi colori un domani potrai trasformarli in variabili globali del tema!
+    uint32_t title_dark  = 0xFFCFB298; 
+    uint32_t title_light = 0xFFE3C6AA; 
+
+    // A. La primissima riga in alto (1px scuro)
+    draw_rect(x + 5, y + 1, width - 10, 1, title_dark);
+    
+    // B. La riga chiara superiore (1px a y+2)
+    draw_rect(x + 3, y + 2, width - 6, 1, title_light);
+    
+    // C. Sfondo della barra (Margini chiari)
+    draw_rect(x + 1, y + 3, width - 2, 27, title_light); 
+
+    // D. Disegniamo le linee SCURE (intarsi, passo 6px)
+    for (int ly = y + 3; ly < y + 30; ly += 6) {
+        int h = 4; 
+        if (ly + h > y + 30) h = (y + 30) - ly; // Sicurezza fondo
+        
+        // Smussatura della prima barra scura per seguire la curva della finestra
+        if (ly == y + 3) {
+            draw_rect(x + 4, ly, width - 8, 1, title_dark);         
+            draw_rect(x + 3, ly + 1, width - 6, h - 1, title_dark); 
+        } else {
+            draw_rect(x + 3, ly, width - 6, h, title_dark);
+        }
+    }
+
+    // ========================================================================
+    // 1.5 EFFETTO LUCE GRADIENTE (Post-Processing Matematico Universale)
+    // ========================================================================
+    // Interessa i primi 18 pixel (che coprono esattamente le prime 3 linee)
+    for (int py = y + 1; py <= y + 18; py++) {
+        // Sicurezza: non disegniamo fuori dallo schermo
+        if (py < 0 || py >= fb_height) continue; 
+
+        // ALZIAMO IL VOLTAGGIO: Parte dal 26% in alto e sfuma dolcemente allo 0% a y+18
+        int white_mix = 26 - ((py - (y + 1)) * 26 / 18); 
+        
+        if (white_mix > 0) {
+            int start_px = x + 1;
+            int end_px = x + width - 1;
+            
+            // Rispettiamo la smussatura per non illuminare i pixel del desktop dietro l'angolo curvo
+            if (py == y + 1) { start_px = x + 5; end_px = x + width - 5; }
+            else if (py == y + 2) { start_px = x + 3; end_px = x + width - 3; }
+
+            // Sicurezza laterale
+            if (start_px < 0) start_px = 0;
+            if (end_px > fb_width) end_px = fb_width;
+
+            uint32_t* row_ptr = &backbuffer[py * fb_width];
+            
+            for (int px = start_px; px < end_px; px++) {
+                uint32_t cp = row_ptr[px];
+                
+                // Estraiamo i canali RGB dal pixel già disegnato
+                uint32_t cr = (cp >> 16) & 0xFF;
+                uint32_t cg = (cp >> 8) & 0xFF;
+                uint32_t cb = cp & 0xFF;
+                
+                // Iniettiamo il bianco puro in percentuale per schiarire (ora fino al 26%!)
+                uint32_t r = cr + ((255 - cr) * white_mix / 100);
+                uint32_t g = cg + ((255 - cg) * white_mix / 100);
+                uint32_t b = cb + ((255 - cb) * white_mix / 100);
+                
+                row_ptr[px] = 0xFF000000 | (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
+    // ========================================================================
+    // 2. Separatore orizzontale
+    // ========================================================================
+    draw_rect(x + 1, y + 30, width - 2, 2, shadow);
+
+    // ========================================================================
+    // 3. Sfondo Centrale (Texture Satinata) - ULTRA VELOCE!
+    // Siccome in alto c'è la titlebar e in basso è squadrato, il background 
+    // inizia comodamente da y+32 e non ha più bisogno di NESSUN clipping curvo!
+    // ========================================================================
+    uint32_t br = (bg_color >> 16) & 0xFF;
+    uint32_t bg = (bg_color >> 8) & 0xFF;
+    uint32_t bb = bg_color & 0xFF;
+
+    int sx = x + 1; if (sx < 0) sx = 0;
+    int sy = y + 32; if (sy < 0) sy = 0;
+    int ex = x + width - 1; if (ex > fb_width) ex = fb_width;
+    int ey = y + height - 1; if (ey > fb_height) ey = fb_height;
+
+    for (int py = sy; py < ey; py++) {
+        uint32_t* row_ptr = &backbuffer[py * fb_width];
+        for (int px = sx; px < ex; px++) {
+            uint32_t rel_x = px - x; uint32_t rel_y = py - y;
+            uint32_t n = rel_x + (rel_y * 57325);
+            n = (n << 13) ^ n;
+            uint32_t nn = (n * (n * n * 15731 + 789221) + 1376312589);
+            int noise = (nn % 7) - 3; int shift = noise * 6; 
+            uint32_t mod_r = br; uint32_t mod_g = bg; uint32_t mod_b = bb;
+            if (shift < 0) { mod_r -= (-shift); mod_g -= (-shift); mod_b -= (-shift); }
+            else if (shift > 0) { mod_r += shift; mod_g += shift; mod_b += shift; }
+            row_ptr[px] = 0xFF000000 | (mod_r << 16) | (mod_g << 8) | mod_b;
+        }
+    }
+
+    // ========================================================================
+    // 4. Bordi Esterni a 1 PIXEL (Spigoli vivi in basso, morbidi in alto)
+    // ========================================================================
+    // Linee rette principali
+    draw_rect(x + 5, y, width - 10, 1, border_tl);              // Top
+    draw_rect(x, y + 5, 1, height - 5, border_tl);              // Left (Va fino in fondo!)
+    draw_rect(x + width - 1, y + 5, 1, height - 5, border_br);  // Right (Va fino in fondo!)
+    draw_rect(x + 1, y + height - 1, width - 2, 1, border_br);  // Bottom (Incrocia i laterali)
+
+    // Angolo Top-Left (Nuova curva rotonda sfalsata a 5 pixel)
+    draw_pixel(x + 4, y + 1, border_tl);
+    draw_pixel(x + 3, y + 1, border_tl);
+    draw_pixel(x + 2, y + 2, border_tl);
+    draw_pixel(x + 1, y + 3, border_tl);
+    draw_pixel(x + 1, y + 4, border_tl);
+
+    // Angolo Top-Right (Curva rotonda sfalsata a 5 pixel)
+    draw_pixel(x + width - 5, y + 1, border_tl);
+    draw_pixel(x + width - 4, y + 1, border_tl);
+    draw_pixel(x + width - 3, y + 2, border_tl);
+    draw_pixel(x + width - 2, y + 3, border_br); // Da qui scatta l'ombra!
+    draw_pixel(x + width - 2, y + 4, border_br);
+}
+
+void draw_char(char c, int x, int y, uint32_t color, int scale) {
+    const uint8_t *glyph = 0;
+    unsigned char uc = (unsigned char)c;
+
+    // OTTIMIZZAZIONE 1: Non disegniamo il vuoto. Lo sfondo è già stato colorato.
+    if (c == ' ') return; 
+
+    if (c >= 'A' && c <= 'Z') glyph = font8x8_A_Z[c - 'A'];
+    else if (c >= 'a' && c <= 'z') glyph = font8x8_a_z[c - 'a'];  
+    else if (c >= '0' && c <= '9') glyph = font8x8_numbers[c - '0'];
+    else if (uc == 224) { static const uint8_t g[8] = {0x10,0x08,0x3C,0x06,0x3E,0x66,0x3B,0x00}; glyph = g; } 
+    else if (uc == 232) { static const uint8_t g[8] = {0x10,0x08,0x3C,0x66,0x7E,0x60,0x3C,0x00}; glyph = g; } 
+    else if (uc == 233) { static const uint8_t g[8] = {0x08,0x10,0x3C,0x66,0x7E,0x60,0x3C,0x00}; glyph = g; } 
+    else if (uc == 236) { static const uint8_t g[8] = {0x20,0x10,0x00,0x38,0x18,0x18,0x3C,0x00}; glyph = g; } 
+    else if (uc == 242) { static const uint8_t g[8] = {0x10,0x08,0x3C,0x66,0x66,0x66,0x3C,0x00}; glyph = g; } 
+    else if (uc == 249) { static const uint8_t g[8] = {0x10,0x08,0x66,0x66,0x66,0x66,0x3B,0x00}; glyph = g; } 
+    else if (c == '-') { static const uint8_t g[8] = {0,0,0,0x3C,0,0,0,0}; glyph = g; }
+    else if (c == '>') { static const uint8_t g[8] = {0x00, 0x40, 0x20, 0x10, 0x20, 0x40, 0x00, 0x00}; glyph = g; }
+    else if (c == '<') { static const uint8_t g[8] = {0x00, 0x10, 0x20, 0x40, 0x20, 0x10, 0x00, 0x00}; glyph = g; }
+    else if (c == ':') { static const uint8_t g[8] = {0,0,0x18,0x18,0,0x18,0x18,0}; glyph = g; }
+    else if (c == ';') { static const uint8_t g[8] = {0,0,0x18,0x18,0,0x18,0x18,0x30}; glyph = g; }
+    else if (c == '.') { static const uint8_t g[8] = {0,0,0,0,0,0x18,0x18,0}; glyph = g; }
+    else if (c == ',') { static const uint8_t g[8] = {0,0,0,0,0,0x18,0x18,0x30}; glyph = g; }
+    else if (c == '(') { static const uint8_t g[8] = {0x0C,0x18,0x30,0x30,0x30,0x18,0x0C,0}; glyph = g; }
+    else if (c == ')') { static const uint8_t g[8] = {0x30,0x18,0x0C,0x0C,0x0C,0x18,0x30,0}; glyph = g; }
+    else if (c == '[') { static const uint8_t g[8] = {0x3C,0x30,0x30,0x30,0x30,0x30,0x3C,0}; glyph = g; }
+    else if (c == ']') { static const uint8_t g[8] = {0x3C,0x0C,0x0C,0x0C,0x0C,0x0C,0x3C,0}; glyph = g; }
+    else if (c == '{') { static const uint8_t g[8] = {0x18,0x30,0x30,0x60,0x30,0x30,0x18,0}; glyph = g; }
+    else if (c == '}') { static const uint8_t g[8] = {0x18,0x0C,0x0C,0x06,0x0C,0x0C,0x18,0}; glyph = g; }
+    else if (c == '/') { static const uint8_t g[8] = {0x00,0x02,0x04,0x08,0x10,0x20,0x40,0x00}; glyph = g; }
+    else if (c == '\\') { static const uint8_t g[8] = {0x00,0x80,0x40,0x20,0x10,0x08,0x04,0x00}; glyph = g; }
+    else if (c == '?') { static const uint8_t g[8] = {0x3C,0x66,0x06,0x0C,0x18,0x00,0x18,0x00}; glyph = g; }
+    else if (c == '!') { static const uint8_t g[8] = {0x18,0x18,0x18,0x18,0x18,0x00,0x18,0x00}; glyph = g; }
+    else if (c == '\'') { static const uint8_t g[8] = {0x18,0x18,0x08,0,0,0,0,0}; glyph = g; }
+    else if (c == '"')  { static const uint8_t g[8] = {0x36,0x36,0x12,0,0,0,0,0}; glyph = g; }
+    else if (c == '_')  { static const uint8_t g[8] = {0,0,0,0,0,0,0,0x7E}; glyph = g; }
+    else if (c == '=')  { static const uint8_t g[8] = {0,0,0x7E,0,0x7E,0,0,0}; glyph = g; }
+    else if (c == '+')  { static const uint8_t g[8] = {0,0x18,0x18,0x7E,0x18,0x18,0,0}; glyph = g; }
+    else if (c == '*')  { static const uint8_t g[8] = {0,0x00,0x54,0x38,0x7C,0x38,0x54,0x00}; glyph = g; }
+    else if (c == '%')  { static const uint8_t g[8] = {0x23,0x23,0x10,0x08,0x04,0x62,0x62,0}; glyph = g; }
+    else if (c == '|')  { static const uint8_t g[8] = {0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18}; glyph = g; }
+    else return;
+
+    if (scale == 1) {
+        // === OTTIMIZZAZIONE 2: FAST PATH (Bypassa draw_rect) ===
+        for (int row = 0; row < 8; row++) {
+            int py = y + row;
+            if (py < 0 || py >= fb_height) continue;
+            
+            uint8_t glyph_row = glyph[row];
+            if (glyph_row == 0) continue; // Salta intere righe vuote del font.
+            
+            uint32_t* row_ptr = &backbuffer[py * fb_width];
+            for (int col = 0; col < 8; col++) {
+                int px = x + col;
+                if (px >= 0 && px < fb_width) {
+                    if (glyph_row & (1 << (7 - col))) {
+                        row_ptr[px] = color;
+                    }
+                }
+            }
+        }
+    } else {
+        // === SLOW PATH: Usato solo per i titoli delle finestre (scale = 2) ===
+        for (int row = 0; row < 8; row++) {
+            for (int col = 0; col < 8; col++) {
+                if (glyph[row] & (1 << (7 - col))) {
+                    draw_rect(x + (col * scale), y + (row * scale), scale, scale, color);
+                }
+            }
+        }
+    }
+}
+
+void draw_string(const char *str, int x, int y, uint32_t color, int scale) {
+    int cursor_x = x;
+    while (*str != '\0') {
+        draw_char(*str, cursor_x, y, color, scale);
+        cursor_x += 8 * scale; // Spostiamo il cursore in base alla grandezza
+        str++;
+    }
+}
+
+// Calcola la larghezza totale (Ora il font è nativamente perfetto, niente scaling)
+int get_prop_string_width(const char* str) {
+    int width = 0;
+    while (*str != '\0') {
+        unsigned char uc = (unsigned char)*str;
+        if (uc < 128) {
+            if (uc == ' ') width += 5; // Spazio largo 5px
+            else width += font_prop[uc].width + 1; // 1px di respiro naturale
+        } else width += 8; 
+        str++;
+    }
+    return width;
+}
+
+// Stampa la stringa in Alta Risoluzione (16px di altezza)
+void draw_prop_string(const char *str, int x, int y, uint32_t color) {
+    int cursor_x = x;
+    
+    while (*str != '\0') {
+        unsigned char uc = (unsigned char)*str;
+        
+        if (uc >= 128) {
+            draw_char(*str, cursor_x, y, color, 1);
+            cursor_x += 8;
+        } 
+        else if (uc == ' ') {
+            cursor_x += 5; // Spazio vuoto
+        }
+        else {
+            uint8_t width = font_prop[uc].width;
+            if (width > 0) {
+                // IL CICLO ORA LEGGE 16 RIGHE DI ALTEZZA
+                for (int row = 0; row < 16; row++) {
+                    uint8_t glyph_row = font_prop[uc].glyph[row];
+                    if (glyph_row == 0) continue;
+                    
+                    for (int col = 0; col < width; col++) {
+                        
+                        if (glyph_row & (1 << (7 - col))) {
+                            draw_pixel(cursor_x + col, y + row, color);
+                        }
+                    }
+                }
+            }
+            cursor_x += width + 1; // Avanziamo per la prossima lettera
+        }
+        str++;
+    }
+}
+
+
+// Calcola la larghezza della stringa in modalità GRASSETTO
+int get_prop_string_width_bold(const char* str) {
+    int width = 0;
+    while (*str != '\0') {
+        unsigned char uc = (unsigned char)*str;
+        if (uc < 128) {
+            if (uc == ' ') width += 6; // Spazio più largo (6px)
+            else width += font_prop[uc].width + 2; // +1 di respiro, +1 di ingombro grassetto
+        } else width += 9; 
+        str++;
+    }
+    return width;
+}
+
+// Stampa la stringa in Alta Risoluzione GRASSETTO (Synthetic Bold)
+void draw_prop_string_bold(const char *str, int x, int y, uint32_t color) {
+    int cursor_x = x;
+    
+    while (*str != '\0') {
+        unsigned char uc = (unsigned char)*str;
+        
+        if (uc >= 128) {
+            draw_char(*str, cursor_x, y, color, 1);
+            draw_char(*str, cursor_x + 1, y, color, 1); // Sovrascrittura per grassetto finto
+            cursor_x += 9;
+        } 
+        else if (uc == ' ') {
+            cursor_x += 6; // Spazio vuoto allargato
+        }
+        else {
+            uint8_t width = font_prop[uc].width;
+            if (width > 0) {
+                for (int row = 0; row < 16; row++) {
+                    uint8_t glyph_row = font_prop[uc].glyph[row];
+                    if (glyph_row == 0) continue;
+                    
+                    for (int col = 0; col < width; col++) {
+                        if (glyph_row & (1 << (7 - col))) {
+                            draw_pixel(cursor_x + col, y + row, color);
+                            draw_pixel(cursor_x + col + 1, y + row, color); // BOLD
+                        }
+                    }
+                }
+            }
+            cursor_x += width + 2; // Avanziamo tenendo conto dell'ispessimento
+        }
+        str++;
+    }
+}
+
+
+// Stampa la stringa tagliandola perfettamente dentro un rettangolo (Clipping) - realizzata per le textbox
+void draw_prop_string_clipped(const char *str, int x, int y, uint32_t color, int cx, int cy, int cw, int ch) {
+    int cursor_x = x;
+    int c_end_x = cx + cw;
+    int c_end_y = cy + ch;
+    
+    while (*str != '\0') {
+        unsigned char uc = (unsigned char)*str;
+        
+        if (uc >= 128) {
+            cursor_x += 8; // Ignoriamo i caratteri speciali estesi nel clipping per ora
+        } 
+        else if (uc == ' ') {
+            cursor_x += 5; // Spazio vuoto
+        }
+        else {
+            uint8_t width = font_prop[uc].width;
+            if (width > 0) {
+                for (int row = 0; row < 16; row++) {
+                    uint8_t glyph_row = font_prop[uc].glyph[row];
+                    if (glyph_row == 0) continue;
+                    
+                    for (int col = 0; col < width; col++) {
+                        if (glyph_row & (1 << (7 - col))) {
+                            int px = cursor_x + col;
+                            int py = y + row;
+                            
+                            // ==========================================
+                            // LA MAGIA DEL CLIPPING PIXEL-PERFECT
+                            // ==========================================
+                            if (px >= cx && px < c_end_x && py >= cy && py < c_end_y) {
+                                draw_pixel(px, py, color);
+                            }
+                        }
+                    }
+                }
+            }
+            cursor_x += width + 1; // Avanziamo
+        }
+        str++;
+    }
+}
+
+
+// ==============================================================================
+// ASSET GRAFICI UI PERSONALIZZATI (Risoluzione 16x16 Pixel-Perfect)
+// ==============================================================================
+
+// Matrice 16x16: La "X" per chiudere (Perfettamente centrata, 10x10 px)
+static const uint16_t ui_glyph_close[16] = {
+0x0000, 0x0000, 0x0000, 0x0000, // Margine Top (4px vuoti, gambe più corte)
+    0x1C38, // ...XXX....XXX... (Gambe larghe 3px)
+    0x0E70, // ....XXX..XXX....
+    0x07E0, // .....XXXXXX.....
+    0x03C0, // ......XXXX...... (Centro compatto e tozzo)
+    0x03C0, // ......XXXX...... 
+    0x07E0, // .....XXXXXX.....
+    0x0E70, // ....XXX..XXX....
+    0x1C38, // ...XXX....XXX...
+    0x0000, 0x0000, 0x0000, 0x0000  // Margine Bottom (4px vuoti)
+};
+
+
+
+// ========================================================
+// ICONA: RIPRISTINA FINESTRA (Clessidra Ruotata ▶◀)
+// ========================================================
+static const uint16_t ui_glyph_restore[16] = {
+    0x0000, 0x0000, 0x0000, 0x0000, // 4px di margine Top (Esattamente come la X)
+    0x1818, // ...XX......XX...  (Basi esterne piatte)
+    0x1C38, // ...XXX....XXX...  (I triangoli si allargano)
+    0x1E78, // ...XXXX..XXXX...  (Punte vicinissime: 2px di spazio)
+    0x1FF8, // ...XXXXXXXXXX...  (Punte unite al centro)
+    0x1FF8, // ...XXXXXXXXXX...  (Punte unite al centro)
+    0x1E78, // ...XXXX..XXXX...  (Punte vicinissime)
+    0x1C38, // ...XXX....XXX...  (I triangoli si stringono)
+    0x1818, // ...XX......XX...  (Basi esterne piatte)
+    0x0000, 0x0000, 0x0000, 0x0000  // 4px di margine Bottom
+};
+
+// Matrice 16x16: Il Triangolo (Perfettamente centrato, base 12px, altezza 6px)
+static const uint16_t ui_glyph_maximize[16] = {
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, // Margine Top profondo (5px vuoti)
+    0x0180, // .......XX.......  (Punta lontana dal bordo)
+    0x03C0, // ......XXXX......
+    0x07E0, // .....XXXXXX.....
+    0x0FF0, // ....XXXXXXXX....
+    0x1FF8, // ...XXXXXXXXXX...
+    0x3FFC, // ..XXXXXXXXXXXX..  (Base non tocca i bordi laterali)
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000  // Margine Bottom profondo (5px vuoti)
+};
+
+// Matrice 16x16: Il Triangolo Inverso per la Riduzione a Icona
+static const uint16_t ui_glyph_minimize[16] = {
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, // Margine Top profondo (5px vuoti)
+    0x3FFC, // ..XXXXXXXXXXXX..  (Base in alto)
+    0x1FF8, // ...XXXXXXXXXX...
+    0x0FF0, // ....XXXXXXXX....
+    0x07E0, // .....XXXXXX.....
+    0x03C0, // ......XXXX......
+    0x0180, // .......XX.......  (Punta in basso)
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000  // Margine Bottom profondo (5px vuoti)
+};
+
+// ==============================================================================
+// MOTORE ICONE DI SISTEMA (16x16 px a 16 Colori)
+// ==============================================================================
+
+// La Palette Standard di Ante-Millennium OS
+const uint32_t icon_palette[16] = {
+    0x00000000, // 0: Trasparente (NON DISEGNARE)
+    0xFF000000, // 1: Nero puro
+    0xFF808080, // 2: Grigio Scuro
+    0xFFC0C0C0, // 3: Grigio Chiaro (Argento)
+    0xFFFFFFFF, // 4: Bianco puro
+    0xFF800000, // 5: Rosso Scuro
+    0xFFFF0000, // 6: Rosso Acceso
+    0xFF008000, // 7: Verde Scuro
+    0xFF00FF00, // 8: Verde Acceso
+    0xFF000080, // 9: Blu Scuro
+    0xFF0000FF, // A(10): Blu Acceso
+    0xFF808000, // B(11): Giallo Scuro (Oliva)
+    0xFFFFFF00, // C(12): Giallo Acceso
+    0xFF800080, // D(13): Viola Scuro
+    0xFFFF00FF, // E(14): Magenta Acceso
+    0xFF00FFFF  // F(15): Ciano (Azzurro)
+};
+
+// L'Archivio di Sistema (MAX 10 Icone predefinite)
+// Ogni icona è formata da 16 righe di 16 numeri (da 0 a 15)
+const uint8_t sys_icons[10][16][16] = {
+    
+    // ICONA 0: DEFAULT (Finestra Generica)
+    {
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0},
+        {0,1,9,9,9,9,9,9,9,9,9,9,9,9,1,0},
+        {0,1,9,9,9,9,9,9,9,9,9,9,9,9,1,0},
+        {0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0},
+        {0,1,4,4,4,4,4,4,4,4,4,4,4,4,1,0},
+        {0,1,4,4,4,4,4,4,4,4,4,4,4,4,1,0},
+        {0,1,4,4,4,4,4,4,4,4,4,4,4,4,1,0},
+        {0,1,4,4,4,4,4,4,4,4,4,4,4,4,1,0},
+        {0,1,4,4,4,4,4,4,4,4,4,4,4,4,1,0},
+        {0,1,4,4,4,4,4,4,4,4,4,4,4,4,1,0},
+        {0,1,4,4,4,4,4,4,4,4,4,4,4,4,1,0},
+        {0,1,4,4,4,4,4,4,4,4,4,4,4,4,1,0},
+        {0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+    },
+    
+    // ICONA 1: IL TERMINALE (Schermo Nero con Cursore Verde)
+    {
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0},
+        {1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1},
+        {1,2,3,3,3,3,3,3,3,3,3,3,3,3,2,1},
+        {1,2,1,1,1,1,1,1,1,1,1,1,1,2,2,1},
+        {1,2,1,8,1,1,1,1,1,1,1,1,1,2,2,1},
+        {1,2,1,1,1,1,1,1,1,1,1,1,1,2,2,1},
+        {1,2,1,1,1,1,1,1,1,1,1,1,1,2,2,1},
+        {1,2,1,1,1,1,1,1,1,1,1,1,1,2,2,1},
+        {1,2,1,1,1,1,1,1,1,1,1,1,1,2,2,1},
+        {1,2,1,1,1,1,1,1,1,1,1,1,1,2,2,1},
+        {1,2,3,3,3,3,3,3,3,3,3,3,3,3,2,1},
+        {1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1},
+        {0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0},
+        {0,0,0,0,1,2,2,2,2,2,2,1,0,0,0,0},
+        {0,0,0,1,2,2,2,2,2,2,2,2,1,0,0,0}
+    },
+
+    // ICONA 2: FILE MANAGER (Cartella Gialla con Ombra Oliva)
+    {
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0},
+        {0,1,12,12,12,12,1,0,0,0,0,0,0,0,0,0},
+        {1,12,12,12,12,12,12,1,1,1,1,1,1,1,0,0},
+        {1,12,11,11,11,11,11,11,11,11,11,11,11,1,0,0},
+        {1,4,4,4,4,4,4,4,4,4,4,4,4,1,0,0},
+        {1,4,4,4,4,4,4,4,4,4,4,4,4,1,0,0},
+        {1,12,12,12,12,12,12,12,12,12,12,12,12,1,0,0},
+        {1,12,12,12,12,12,12,12,12,12,12,12,12,1,0,0},
+        {1,12,12,12,12,12,12,12,12,12,12,12,12,1,0,0},
+        {1,12,12,12,12,12,12,12,12,12,12,12,12,1,0,0},
+        {1,12,12,12,12,12,12,12,12,12,12,12,12,1,0,0},
+        {1,11,11,11,11,11,11,11,11,11,11,11,11,1,0,0},
+        {0,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+    },
+
+    // ICONA 3: APPLICATIONS (4 Cubi Colorati)
+    {
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,0,1,1,1,1,0,0,0,1,1,1,1,0,0,0},
+        {0,1,6,6,6,6,1,0,1,8,8,8,8,1,0,0},
+        {0,1,6,4,6,6,1,0,1,8,4,8,8,1,0,0},
+        {0,1,6,6,6,6,1,0,1,8,8,8,8,1,0,0},
+        {0,1,5,5,5,5,1,0,1,7,7,7,7,1,0,0},
+        {0,0,1,1,1,1,0,0,0,1,1,1,1,0,0,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,0,1,1,1,1,0,0,0,1,1,1,1,0,0,0},
+        {0,1,10,10,10,10,1,0,1,12,12,12,12,1,0,0},
+        {0,1,10,4,10,10,1,0,1,12,4,12,12,1,0,0},
+        {0,1,10,10,10,10,1,0,1,12,12,12,12,1,0,0},
+        {0,1,9,9,9,9,1,0,1,11,11,11,11,1,0,0},
+        {0,0,1,1,1,1,0,0,0,1,1,1,1,0,0,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+    },
+
+    // ICONA 4: SETTINGS (Ingranaggio con Nucleo Blu e Ciano Luminoso!)
+    {
+        {0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0},
+        {0,0,0,0,0,1,3,3,3,1,0,0,0,0,0,0},
+        {0,0,1,1,0,1,3,2,3,1,0,1,1,0,0,0},
+        {0,1,3,3,1,1,3,2,3,1,1,3,3,1,0,0},
+        {0,1,3,2,3,3,3,3,3,3,3,2,3,1,0,0},
+        {0,0,1,3,3,1,1,10,1,1,3,3,1,0,0,0},
+        {0,1,3,3,1,10,15,15,10,1,3,3,1,0,0}, // Core Top
+        {1,3,2,3,1,15, 4, 4,15,1,3,2,3,1,0}, // Core Center White
+        {1,3,2,3,1,15, 4, 4,15,1,3,2,3,1,0}, // Core Center White
+        {0,1,3,3,1,10,15,15,10,1,3,3,1,0,0}, // Core Bottom
+        {0,0,1,3,3,1,1,10,1,1,3,3,1,0,0,0},
+        {0,1,3,2,3,3,3,3,3,3,3,2,3,1,0,0},
+        {0,1,3,3,1,1,3,2,3,1,1,3,3,1,0,0},
+        {0,0,1,1,0,1,3,2,3,1,0,1,1,0,0,0},
+        {0,0,0,0,0,1,3,3,3,1,0,0,0,0,0,0},
+        {0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0}
+    },
+
+    // ICONA 5: EXIT (Vecchio Monitor CRT con un mini Sistema Operativo disegnato dentro!)
+    {
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0},
+        {0,1,3,3,3,3,3,3,3,3,3,3,3,3,1,0}, // Bordo superiore scocca
+        {0,1,3,1,1,1,1,1,1,1,1,1,1,3,1,0}, // Cornice nera
+        {0,1,3,1,15,15,15,15,15,15,15,15,1,3,1,0}, // Desktop Azzurro
+        {0,1,3,1,15, 3, 3, 3,15,15,15,15,1,3,1,0}, // Barra titolo finestra
+        {0,1,3,1,15, 4, 4, 4,15,15,15,15,1,3,1,0}, // Corpo della finestra bianca
+        {0,1,3,1,15,15,15,15,15,15,15,15,1,3,1,0}, // Desktop Azzurro
+        {0,1,3,1, 3, 3, 3, 3, 3, 3, 3, 3,1,3,1,0}, // Taskbar inferiore!
+        {0,1,3,1,1,1,1,1,1,1,1,1,1,3,1,0}, // Cornice inferiore
+        {0,1,3,3,3,3,3,3,3,3,3,6,3,3,1,0}, // Scocca con LED Rosso acceso
+        {0,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0},
+        {0,0,0,0,0,1,3,3,3,1,0,0,0,0,0,0}, // Collo del monitor
+        {0,0,0,0,1,3,3,3,3,3,1,0,0,0,0,0}, 
+        {0,0,0,1,3,3,3,3,3,3,3,1,0,0,0,0}, // Base
+        {0,0,0,1,1,1,1,1,1,1,1,1,0,0,0,0}  
+    },
+    // ICONA 6: LENTE D'INGRANDIMENTO (Ricerca)
+    {
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0},
+        {0,0,0,1,15,15,15,4,4,1,0,0,0,0,0,0}, // 15=Ciano, 4=Riflesso Bianco
+        {0,0,1,15,15,15,15,4,15,1,0,0,0,0,0,0},
+        {0,0,1,15,15,15,15,15,15,1,0,0,0,0,0,0},
+        {0,0,1,4,15,15,15,15,15,1,0,0,0,0,0,0},
+        {0,0,1,4,15,15,15,15,15,1,0,0,0,0,0,0},
+        {0,0,0,1,4,4,15,15,1,2,1,0,0,0,0,0}, // 2=Manico Grigio Scuro
+        {0,0,0,0,1,1,1,1,1,1,2,1,0,0,0,0},
+        {0,0,0,0,0,0,0,0,1,2,2,1,0,0,0,0},
+        {0,0,0,0,0,0,0,0,0,1,2,2,1,0,0,0},
+        {0,0,0,0,0,0,0,0,0,0,1,2,2,1,0,0},
+        {0,0,0,0,0,0,0,0,0,0,0,1,2,2,1,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+    }
+};
+
+// La funzione che dipinge l'icona a schermo
+void draw_icon_16(int icon_id, int start_x, int start_y) {
+    if (icon_id < 0 || icon_id > 9) icon_id = 0; // Fallback di sicurezza
+    
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            uint8_t color_index = sys_icons[icon_id][y][x];
+            if (color_index > 0) { // L'indice 0 significa trasparente!
+                draw_pixel(start_x + x, start_y + y, icon_palette[color_index]);
+            }
+        }
+    }
+}
+
+
+
+
+// Nuova funzione per disegnare glifi ad alta risoluzione (Senza "gonfiarli")
+void draw_ui_glyph_16(const uint16_t* glyph, int x, int y, uint32_t color) {
+    for (int row = 0; row < 16; row++) {
+        for (int col = 0; col < 16; col++) {
+            // Controlliamo ogni singolo bit da sinistra (15) a destra (0)
+            if (glyph[row] & (1 << (15 - col))) {
+                draw_pixel(x + col, y + row, color); 
+            }
+        }
+    }
+}
+
+// ========================================================
+// MOTORE BMP INTEGRATO NEL KERNEL (Per Bootscreen)
+// ========================================================
+
+int load_bootscreen_logo() {
+    char path[] = "/system/media/bootscreen.bmp";
+    uint32_t file_size = 0;
+
+    ext2_read_file(path, 0, 0, &file_size);
+    if (file_size == 0) return 0;
+
+    bootscreen_logo_raw = (char*)kmalloc(file_size);
+    if (!bootscreen_logo_raw) return 0;
+
+    ext2_read_file(path, bootscreen_logo_raw, file_size, &file_size);
+
+    if (bootscreen_logo_raw[0] != 'B' || bootscreen_logo_raw[1] != 'M') {
+        kfree(bootscreen_logo_raw); bootscreen_logo_raw = 0; return 0;
+    }
+
+    bootscreen_pixel_offset = *(uint32_t*)(bootscreen_logo_raw + 0x0A);
+    bootscreen_logo_w = *(uint32_t*)(bootscreen_logo_raw + 0x12);
+    bootscreen_logo_h = *(uint32_t*)(bootscreen_logo_raw + 0x16);
+    uint16_t bpp = *(uint16_t*)(bootscreen_logo_raw + 0x1C);
+
+    if (bpp != 24) {
+        kfree(bootscreen_logo_raw); bootscreen_logo_raw = 0; return 0;
+    }
+    return 1;
+}
+
+void draw_bootscreen_background() {
+    draw_rect(0, 0, fb_width, fb_height, COLOR_SKY_BLUE);
+
+    if (!bootscreen_logo_raw) {
+        swap_buffers();
+        return;
+    }
+
+    int center_x = (fb_width - bootscreen_logo_w) / 2;
+    int center_y = (fb_height - bootscreen_logo_h) / 2;
+    int row_padded = (bootscreen_logo_w * 3 + 3) & (~3);
+
+    for (uint32_t y = 0; y < bootscreen_logo_h; y++) {
+        uint32_t bmp_y = (bootscreen_logo_h - 1) - y; 
+        for (uint32_t x = 0; x < bootscreen_logo_w; x++) {
+            uint32_t bmp_idx = bootscreen_pixel_offset + (bmp_y * row_padded) + (x * 3);
+            uint8_t b = bootscreen_logo_raw[bmp_idx];
+            uint8_t g = bootscreen_logo_raw[bmp_idx + 1];
+            uint8_t r = bootscreen_logo_raw[bmp_idx + 2];
+            uint32_t color = (r << 16) | (g << 8) | b;
+            draw_pixel(center_x + x, center_y + y, color);
+        }
+    }
+    swap_buffers(); // Manda l'immagine finita a schermo
+}
+
+void bootscreen_status(const char* msg) {
+    int text_x = 50;
+    int text_y = fb_height - 60; // In basso
+    int area_w = fb_width - 100;
+
+    
+    draw_rect(text_x, text_y - 5, area_w, 30, COLOR_SKY_BLUE);
+    
+    draw_prop_string_bold(msg, text_x, text_y, 0xFF000000);
+    swap_buffers(); 
+    
+    // Ora generiamo un'attesa per permettere all'utente di leggere cosa sta succedendo
+    sleep(1000);
+}
+
+// ==========================================
+// SOTTOSISTEMA PCI (Peripheral Component Interconnect)
+// ==========================================
+
+uint32_t pci_read_dword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
+    uint32_t address = (uint32_t)((bus << 16) | (slot << 11) | (func << 8) | (offset & 0xFC) | ((uint32_t)0x80000000));
+    outl(0xCF8, address);
+    return inl(0xCFC);
+}
+
+uint16_t pci_read_word(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
+    uint32_t dword = pci_read_dword(bus, slot, func, offset);
+    return (uint16_t)((dword >> ((offset & 2) * 8)) & 0xFFFF);
+}
+
+void pci_scan() {
+    print_term("Scansione Bus PCI in corso...");
+    int found = 0;
+
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            uint16_t vendor = pci_read_word(bus, slot, 0, 0);
+            
+            if (vendor != 0xFFFF) {
+                uint16_t device = pci_read_word(bus, slot, 0, 2);
+                uint16_t class_subclass = pci_read_word(bus, slot, 0, 10);
+                uint8_t class_id = (class_subclass >> 8) & 0xFF;
+
+                char msg[100];
+                char v_str[16], d_str[16];
+                itoa_hex(vendor, v_str);
+                itoa_hex(device, d_str);
+
+                int idx = 0;
+                char* l1 = "Trovato -> Vendor: "; while(*l1) msg[idx++] = *l1++;
+                char* v = v_str; while(*v) msg[idx++] = *v++;
+                char* l2 = " Dev: "; while(*l2) msg[idx++] = *l2++;
+                char* d = d_str; while(*d) msg[idx++] = *d++;
+                
+                if (class_id == 0x04) {
+                    char* l3 = " [ SCHEDA AUDIO! ]"; while(*l3) msg[idx++] = *l3++;
+                }
+                
+                msg[idx] = '\0';
+                print_term(msg);
+                found++;
+            }
+        }
+    }
+    
+    if (found == 0) print_term("Nessuna periferica PCI trovata.");
+}
+
+// ==========================================
+// REAL TIME CLOCK (CMOS)
+// ==========================================
+uint8_t rtc_second, rtc_minute, rtc_hour, rtc_day, rtc_month, rtc_year;
+
+// Legge un registro specifico dal chip CMOS
+uint8_t get_rtc_register(int reg) {
+    outb(0x70, reg);
+    return inb(0x71);
+}
+
+// Controlla se l'orologio sta aggiornando i dati proprio in questo istante
+int get_rtc_update_in_progress() {
+    outb(0x70, 0x0A);
+    return (inb(0x71) & 0x80);
+}
+
+// Funzione principale che legge data e ora perfette
+void read_rtc() {
+    // Aspettiamo che il chip abbia finito di "ticchettare" per non leggere dati a metà
+    while (get_rtc_update_in_progress());
+
+    rtc_second = get_rtc_register(0x00);
+    rtc_minute = get_rtc_register(0x02);
+    rtc_hour   = get_rtc_register(0x04);
+    rtc_day    = get_rtc_register(0x07);
+    rtc_month  = get_rtc_register(0x08);
+    rtc_year   = get_rtc_register(0x09);
+
+    uint8_t registerB = get_rtc_register(0x0B);
+
+    // Se i dati sono nel vecchio formato BCD, li convertiamo nel nostro formato decimale standard
+    if (!(registerB & 0x04)) {
+        rtc_second = (rtc_second & 0x0F) + ((rtc_second / 16) * 10);
+        rtc_minute = (rtc_minute & 0x0F) + ((rtc_minute / 16) * 10);
+        rtc_hour = ( (rtc_hour & 0x0F) + (((rtc_hour & 0x70) / 16) * 10) ) | (rtc_hour & 0x80);
+        rtc_day = (rtc_day & 0x0F) + ((rtc_day / 16) * 10);
+        rtc_month = (rtc_month & 0x0F) + ((rtc_month / 16) * 10);
+        rtc_year = (rtc_year & 0x0F) + ((rtc_year / 16) * 10);
+    }
+}
+
+
+
+// ==========================================
+// LETTURA RAM HARDWARE (CMOS)
+// ==========================================
+uint32_t detect_system_ram() {
+    // Registri 0x34 e 0x35 del CMOS contengono la memoria oltre i 16MB (in blocchi da 64KB)
+    outb(0x70, 0x34);
+    uint8_t ext_lo = inb(0x71);
+    outb(0x70, 0x35);
+    uint8_t ext_hi = inb(0x71);
+    
+    // Uniamo le due metà (Bitwise shift)
+    uint32_t ext_mem_64k = (ext_hi << 8) | ext_lo;
+    
+    if (ext_mem_64k > 0) {
+        // RAM = 16 MB di base + i blocchi estesi convertiti in MB
+        return 16 + ((ext_mem_64k * 64) / 1024);
+    }
+    
+    // Fallback per PC storici con RAM < 16MB (Registri 0x30 e 0x31)
+    outb(0x70, 0x30);
+    uint8_t low = inb(0x71);
+    outb(0x70, 0x31);
+    uint8_t high = inb(0x71);
+    uint32_t ext_mem_kb = (high << 8) | low;
+    
+    return 1 + (ext_mem_kb / 1024);
+}
+
+// Piccola funzione di utilità per trasformare un numero in due caratteri di testo (es: 9 -> "09")
+void put_2digits(uint8_t val, char* buf, int offset) {
+    buf[offset] = '0' + (val / 10);
+    buf[offset + 1] = '0' + (val % 10);
+}
+
+
+
+// Prende una finestra e la spinge in cima all'array
+void bring_to_front(int win_idx) {
+    int pos = -1;
+    for(int i = 0; i < MAX_WINDOWS; i++) { if (window_order[i] == win_idx) pos = i; }
+    if (pos <= 0) return; // È già in cima, o non esiste!
+    
+    // Facciamo scivolare tutte le altre finestre di 1 posto verso il basso
+    for(int i = pos; i > 0; i--) { window_order[i] = window_order[i-1]; }
+    window_order[0] = win_idx; // Mettiamo la nostra in cima!
+
+    // ========================================================
+    // PROTEZIONE Z-INDEX DEI MENU
+    // Array esplicito: proteggiamo SOLO i due menu
+    // ========================================================
+    int menus_to_protect[2] = {WIN_TYPE_START_MENU, WIN_TYPE_APP_MENU};
+    
+    for (int m = 0; m < 2; m++) {
+        int menu_type = menus_to_protect[m];
+        int menu_idx = -1;
+        
+        for(int i = 0; i < MAX_WINDOWS; i++) {
+            if(windows[i].active && windows[i].type == menu_type) menu_idx = i;
+        }
+        
+        if (menu_idx != -1) {
+            int menu_pos = -1;
+            for(int i = 0; i < MAX_WINDOWS; i++) { if(window_order[i] == menu_idx) menu_pos = i; }
+            
+            if (menu_pos > 0) {
+                for(int i = menu_pos; i > 0; i--) { window_order[i] = window_order[i-1]; }
+                window_order[0] = menu_idx; // I Menu si riprendono la priorita'
+            }
+        }
+    }
+}
+
+
+int global_creation_count = 0;
+
+// Trova le finestre della Taskbar e le ordina cronologicamente
+int get_taskbar_windows(int* valid_wins_array) {
+    int count = 0;
+    for(int i = 0; i < MAX_WINDOWS; i++) {
+        if(windows[i].active && windows[i].type != WIN_TYPE_START_MENU && windows[i].type != WIN_TYPE_APP_MENU) {
+            valid_wins_array[count++] = i;
+        }
+    }
+    // Bubble Sort in base all'ID di creazione (dal più vecchio al più nuovo)
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = 0; j < count - i - 1; j++) {
+            if (windows[valid_wins_array[j]].creation_id > windows[valid_wins_array[j+1]].creation_id) {
+                int temp = valid_wins_array[j];
+                valid_wins_array[j] = valid_wins_array[j+1];
+                valid_wins_array[j+1] = temp;
+            }
+        }
+    }
+    return count;
+}
+
+
+// Cerca uno slot libero e crea una nuova finestra
+int open_window(int type, const char* title, int x, int y, int w, int h, int owner_pid) {
+    
+    // Iniziamo da 1. Lo slot 0 è permanentemente riservato 
+    // per la logica dello "Zero" dell'SDK (Finestra Madre)
+    for(int i = 1; i < MAX_WINDOWS; i++) {
+        if (windows[i].active == 0) { 
+            windows[i].active = 1;
+            windows[i].type = type;
+            
+            // ========================================================================
+            // PUNTO 2: CENTRATURA AUTOMATICA ALL'APERTURA
+            // Se non è un menu di sistema, posiziona la finestra al centro del desktop
+            // ========================================================================
+            if (type != WIN_TYPE_START_MENU && type != WIN_TYPE_APP_MENU) {
+                x = (fb_width - w) / 2;
+                y = (fb_height - 30 - h) / 2; // Centrato nell'area utile sopra la taskbar
+                if (x < 0) x = 0;
+                if (y < 0) y = 0;
+            }
+            
+            windows[i].x = x; windows[i].y = y;
+            windows[i].w = w; windows[i].h = h;
+            windows[i].creation_id = global_creation_count++;
+            windows[i].owner_pid = owner_pid; // SALVIAMO IL PROPRIETARIO
+
+            // ========================================================================
+            // PUNTO 1: Salviamo la dimensione di partenza come base personalizzata
+            // ========================================================================
+            windows[i].base_w = w;
+            windows[i].base_h = h;
+            windows[i].min_w = w; 
+            windows[i].min_h = h;
+            
+            // ASSEGNAZIONE INTELLIGENTE DELL'ICONA IN BASE AL TIPO
+            if (type == WIN_TYPE_TERMINAL) windows[i].icon_id = 1; // Icona Terminale (1)
+            else windows[i].icon_id = 0; // Icona Finestra Generica (0)
+
+            
+            // Copiamo il percorso completo per la nuvoletta (max 63 caratteri)
+            int p = 0; while (title[p] != '\0' && p < 63) { windows[i].full_path[p] = title[p]; p++; }
+            windows[i].full_path[p] = '\0';
+
+            // Estraiamo solo il nome finale per la barra del titolo (es: "editor.edxi")
+            int last_slash = -1;
+            for (int k = 0; k < p; k++) { if (windows[i].full_path[k] == '/') last_slash = k; }
+            
+            int t = 0;
+            if (last_slash != -1) {
+                int start = last_slash + 1; // Partiamo da dopo lo slash
+                while(windows[i].full_path[start] != '\0' && t < 31) { windows[i].title[t++] = windows[i].full_path[start++]; }
+            } else {
+                while(windows[i].full_path[t] != '\0' && t < 31) { windows[i].title[t] = windows[i].full_path[t]; t++; }
+            }
+            windows[i].title[t] = '\0';
+
+            // Svuotiamo la memoria privata della finestra
+            windows[i].t_len = 0;
+            windows[i].t_cursor = 0;
+            windows[i].t_scroll = 0;
+            windows[i].t_head = 0; // Azzera l'indice
+            windows[i].ui_count = 0;
+            
+            // FIX VISIBILITÀ MENU/TERMINALI:
+            // Solo le App personalizzate (APP_GUI) partono nascoste in attesa del setup.
+            // I menu di sistema e i terminali nascono immediatamente visibili!
+            windows[i].is_initializing = (type == WIN_TYPE_APP_GUI) ? 1 : 0; 
+            
+            windows[i].is_maximized = 0; // Partono sempre in modalità normale
+            windows[i].is_minimized = 0; 
+            for(int r=0; r<TERM_MAX_ROWS; r++) windows[i].t_history[r][0] = '\0';
+
+            bring_to_front(i); // Quando apro un'app, appare subito in primo piano
+            global_active_win = i; // Prende subito il Focus
+            return i; // Ritorna l'ID (l'indice) della nuova finestra
+        }
+    }
+    return -1; // Errore: Troppe finestre aperte
+}
+
+// Inizializza il Desktop all'avvio
+void init_window_manager() {
+    // Svuotiamo la memoria
+    for(int i = 0; i < MAX_WINDOWS; i++) {
+        windows[i].active = 0;
+        window_order[i] = i; // Inizialmente l'ordine è 0, 1, 2, 3...
+    }
+    
+    // Qui c'era il comando per aprire un terminale all'avvio. Un passaggio storico
+    // che rimane un ricordo di quando il sistema non aveva nemmeno un menu
+    // (quindi l'ho commentato anziché eliminarlo)
+    //open_window(WIN_TYPE_TERMINAL, "Ante-M OS x86", 262, 184, 500, 400);
+    
+}
+
+// --- GESTORE DELLE SYSCALL 0x80 (Modello Linux Standard) ---
+volatile uint32_t system_ticks = 0;
+volatile int refresh_requested = 0;
+
+
+// Aggiorna magneticamente il target della Taskbar
+void update_taskbar_state() {
+    int needs_docking = 0;
+    for(int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i].active && !windows[i].is_minimized && windows[i].is_maximized) {
+            if (windows[i].type != WIN_TYPE_START_MENU && windows[i].type != WIN_TYPE_APP_MENU) {
+                needs_docking = 1;
+                break;
+            }
+        }
+    }
+    // Se c'è una finestra massimizzata va a 0 (tocca il fondo), altrimenti torna a 5 (fluttua)
+    taskbar_target_offset = needs_docking ? 0 : 5;
+}
+
+void render_desktop(int mouse_x, int mouse_y, int is_clicking) {
+    //draw_rect(0, 0, fb_width, fb_height, 0xFF008080); // vecchio Sfondo Desktop
+    //draw_rect(0, 0, fb_width, fb_height, 0xFF386DA4); // lo sfondo blu vecchio
+    //draw_rect(0, 0, fb_width, fb_height, 0xFF264653); // Ottanio Profondo
+    //draw_rect(0, 0, fb_width, fb_height, 0xFF3D3B3A); // Grigio Ardesia Caldo
+    //draw_rect(0, 0, fb_width, fb_height, 0xFF4A5D4E); // Verde Salvia Scuro
+    //draw_rect(0, 0, fb_width, fb_height, 0xFF1F2937); // Blu notte
+    draw_rect(0, 0, fb_width, fb_height, 0xFFA9BCC6); // Azzurro Polvere
+
+    // --- CERCHIAMO LA FINESTRA IN PRIMO PIANO ---
+    
+    int top_app_win = global_active_win;
+
+    // Disegniamo le finestre dal fondo alla cima
+    for(int order_idx = MAX_WINDOWS -1; order_idx >= 0; order_idx--) {
+        int w = window_order[order_idx]; 
+        if (windows[w].active) {
+            window_t* win = &windows[w];
+            
+            // Salta il disegno se la finestra è minimizzata O ancora in inizializzazione
+            if (win->is_minimized || win->is_initializing) continue;
+
+
+
+            if (win->type != WIN_TYPE_START_MENU) {
+                
+                // Controlliamo se questa specifica finestra è quella in cima
+                int is_top = (w == top_app_win); 
+                
+                // Passiamo l'informazione alla nostra funzione aggiornata
+                draw_window(win->x, win->y, win->w, win->h, is_top);
+                
+
+
+                // 1. Disegniamo l'icona in alto a sinistra
+                draw_icon_16(win->icon_id, win->x + 6, win->y + 8);
+                
+                // 2. Calcoliamo l'ingombro del testo (senza stamparlo subito)
+                int text_width_px = get_prop_string_width_bold(win->title);
+                
+                // --- COORDINATE PULSANTI ---
+                int btn_x = win->x + win->w - 29; 
+                int btn_y = win->y + 6;
+                int max_x = win->x + win->w - 56; 
+                int max_y = win->y + 6;
+                int min_x = win->x + win->w - 83; 
+                int min_y = win->y + 6;
+
+                // =======================================================
+                // DECORAZIONE BARRA TITOLO (Badge Testo + Linea Singola)
+                // =======================================================
+                uint32_t dec_color = 0xFFCFB298;    // Sabbia Scuro Unificato (Niente più marrone)
+                uint32_t border_color = 0xFFFFFFFF; // Contorno Bianco
+                uint32_t text_color = 0xFF000000;   // Testo Nero
+
+                // A. IL BADGE DEL TESTO (Rettangolo Arrotondato "A Pillola")
+                int badge_x = win->x + 25; // Spostato leggermente per fare spazio all'icona
+                int badge_y = win->y + 5;  // Avvolge perfettamente l'altezza del testo
+                int badge_w = text_width_px + 8; // 4px di padding per lato
+                int badge_h = 22;
+
+                // Forma base arrotondata (Sfondo bianco che funge da bordo 1px)
+                draw_rect(badge_x + 2, badge_y, badge_w - 4, badge_h, border_color);
+                draw_rect(badge_x, badge_y + 2, badge_w, badge_h - 4, border_color);
+                
+                // Riempimento color sabbia
+                draw_rect(badge_x + 2, badge_y + 1, badge_w - 4, badge_h - 2, dec_color);
+                draw_rect(badge_x + 1, badge_y + 2, badge_w - 2, badge_h - 4, dec_color);
+                
+                // Pixel di raccordo per la morbidezza del bordo bianco
+                draw_pixel(badge_x + 1, badge_y + 1, border_color);
+                draw_pixel(badge_x + badge_w - 2, badge_y + 1, border_color);
+                draw_pixel(badge_x + 1, badge_y + badge_h - 2, border_color);
+                draw_pixel(badge_x + badge_w - 2, badge_y + badge_h - 2, border_color);
+
+                // B. STAMPIAMO IL TESTO (Ora perfettamente centrato nel suo Badge)
+                draw_prop_string_bold(win->title, badge_x + 4, win->y + 8, text_color);
+
+                
+                // =======================================================
+                
+                // --- MAGIA HOVER: Colore dei simboli (X e Triangoli) ---
+                uint32_t symbol_color;
+                if (is_top) {
+                    // Creiamo un'UNICA area di Hover che copre i 3 bottoni e gli spazi tra di essi
+                    
+                    if (mouse_x >= min_x && mouse_x <= btn_x + 23 && mouse_y >= btn_y && mouse_y <= btn_y + 19) {
+                        symbol_color = 0xFFFFFFFF; // Bianco (Hover)
+                    } else {
+                        symbol_color = 0xFF000000; // Nero (Default attiva)
+                    }
+                } else {
+                    symbol_color = 0xFF000000; 
+                }
+
+                
+                // =======================================================
+                // MOTORE RENDERING AQUA GLASS (VERSIONE ARROTONDATA UNIVERSALE)
+                // =======================================================
+                
+                // Definiamo costanti di luce e ombra universali per mantenere il vetro coerente
+                uint32_t glass_light = 0xFFFFFFFF;
+                uint32_t glass_shadow = 0xFF575757;
+
+                // --- DISEGNO PULSANTE 'X' (Chiusura) ---
+                
+                uint32_t close_bg = is_top ? 0xFFDF7B62 : 0xFFC0C0C0;
+                uint32_t cur_close_light = glass_light;
+                int c_pressed = (is_clicking && pressed_window_id == w && pressed_window_btn == 1);
+                
+                if (c_pressed) { 
+                    uint32_t r = ((close_bg >> 16) & 0xFF) * 75 / 100;
+                    uint32_t g = ((close_bg >> 8) & 0xFF) * 75 / 100;
+                    uint32_t b = (close_bg & 0xFF) * 75 / 100;
+                    close_bg = 0xFF000000 | (r << 16) | (g << 8) | b;
+                    cur_close_light = 0xFFC0C0C0; 
+                }
+                draw_button(btn_x, btn_y, 24, 20, close_bg, cur_close_light, glass_shadow);
+                draw_ui_glyph_16(ui_glyph_close, btn_x + 4, btn_y + 2, symbol_color);
+
+                // --- DISEGNO PULSANTE MASSIMIZZA ---
+                uint32_t max_bg = 0xFFC0C0C0;
+                uint32_t cur_max_light = glass_light;
+                int max_pressed = (is_clicking && pressed_window_id == w && pressed_window_btn == 2);
+                
+                if (max_pressed) {
+                    uint32_t r = ((max_bg >> 16) & 0xFF) * 75 / 100;
+                    uint32_t g = ((max_bg >> 8) & 0xFF) * 75 / 100;
+                    uint32_t b = (max_bg & 0xFF) * 75 / 100;
+                    max_bg = 0xFF000000 | (r << 16) | (g << 8) | b;
+                    cur_max_light = 0xFFC0C0C0;
+                }
+                draw_button(max_x, max_y, 24, 20, max_bg, cur_max_light, glass_shadow);
+                if (win->is_maximized) draw_ui_glyph_16(ui_glyph_restore, max_x + 4, max_y + 2, symbol_color);
+                else draw_ui_glyph_16(ui_glyph_maximize, max_x + 4, max_y + 2, symbol_color);
+
+                // --- DISEGNO PULSANTE MINIMIZZA ---
+                uint32_t min_bg = 0xFFC0C0C0;
+                uint32_t cur_min_light = glass_light;
+                int min_pressed = (is_clicking && pressed_window_id == w && pressed_window_btn == 3);
+                
+                if (min_pressed) {
+                    uint32_t r = ((min_bg >> 16) & 0xFF) * 75 / 100;
+                    uint32_t g = ((min_bg >> 8) & 0xFF) * 75 / 100;
+                    uint32_t b = (min_bg & 0xFF) * 75 / 100;
+                    min_bg = 0xFF000000 | (r << 16) | (g << 8) | b;
+                    cur_min_light = 0xFFC0C0C0;
+                }
+                draw_button(min_x, min_y, 24, 20, min_bg, cur_min_light, glass_shadow);
+                draw_ui_glyph_16(ui_glyph_minimize, min_x + 4, min_y + 2, symbol_color);
+
+            
+
+
+
+                // --- ANGOLO DI RIDIMENSIONAMENTO ---
+                
+                int res_x = win->x + win->w - 16;
+                int res_y = win->y + win->h - 16;
+                
+                uint32_t resize_color = is_top ? 0xFF808080 : 0xFF808080;
+                
+                // 1. Linee Esterne Nere (Accorciate da 16/14 a 12px per non tagliare la curva della finestra)
+                draw_rect(res_x + 14, res_y, 2, 12, 0xFF000000); // Destra
+                draw_rect(res_x, res_y + 14, 12, 2, 0xFF000000); // Basso
+                
+                // 2. Linee Interne Colorate (Accorciate in proporzione per incastrarsi)
+                draw_rect(res_x + 12, res_y, 2, 10, resize_color); // Destra
+                draw_rect(res_x, res_y + 12, 10, 2, resize_color); // Basso
+            }
+            // ----------------------------------------
+            
+            if (win->type == WIN_TYPE_TERMINAL) {
+                int term_x = win->x + 4;
+                int term_y = win->y + 32; // 4px (bordo) + 24px (barra) + 4px (spazio)
+                int term_w = win->w - 8;  // 4px a sinistra e 4px a destra
+                int term_h = win->h - 36; // 32px in alto e 4px in basso
+                draw_rect(term_x, term_y, term_w, term_h, 0xFF000000);
+                
+                
+                
+                // Calcoliamo quante righe visibili ci stanno magicamente in base all'altezza
+                // Abbiamo aumentato il margine inferiore (da 40 a 60) per ALZARE tutta l'area di stampa
+                int calc_vis_rows = (term_h - 60) / 14; 
+                if (calc_vis_rows > TERM_MAX_ROWS) calc_vis_rows = TERM_MAX_ROWS;
+                
+                
+                // ==========================================
+                // MOTORE DI IMPAGINAZIONE E SCROLL ASSOLUTO
+                // ==========================================
+                int max_chars_per_line = (term_w - 40) / 8;
+                if (max_chars_per_line < 10) max_chars_per_line = 10;
+                int max_visible_rows = (term_h - 60) / 14;
+
+                // 1. PRE-CALCOLO: Quante righe visive occupa ogni comando in memoria?
+                int row_vlines[TERM_MAX_ROWS];
+                int total_vlines = 0;
+                for (int r = 0; r < TERM_MAX_ROWS; r++) {
+                    int real_r = (win->t_head + r) % TERM_MAX_ROWS; // LETTURA CIRCOLARE
+                    
+                    if (win->t_history[real_r][0] == '\0') {
+                        row_vlines[real_r] = 0;
+                    } else {
+                        int lines = 0;
+                        char* str = win->t_history[real_r];
+                        int len = 0; while(str[len]) len++;
+                        int i = 0;
+                        while (i < len) {
+                            if (len - i <= max_chars_per_line) {
+                                lines++; break;
+                            } else {
+                                int bp = max_chars_per_line;
+                                while(bp > 0 && str[i+bp] != ' ') bp--;
+                                if (bp == 0) bp = max_chars_per_line;
+                                lines++; i += bp; if (str[i] == ' ') i++;
+                            }
+                        }
+                        row_vlines[real_r] = lines;
+                        total_vlines += lines;
+                    }
+                }
+
+                // 2. LOGICA SCROLLBAR PROPORZIONALE (Ora calcolata sulle righe VISIVE)
+                int max_scrl = total_vlines - max_visible_rows;
+                if (max_scrl < 0) max_scrl = 0;
+
+                // Auto-correzione
+                if (win->t_scroll > max_scrl) win->t_scroll = max_scrl;
+                if (win->t_scroll < 0) win->t_scroll = 0;
+
+                // Calcoliamo a quale "riga visiva assoluta" corrisponde la cima della finestra
+                int top_visible_line = 0;
+                if (total_vlines > max_visible_rows) {
+                    top_visible_line = total_vlines - max_visible_rows - win->t_scroll;
+                }
+
+                // 3. DISEGNO TESTO
+                int current_y = term_y + 10;
+                int drawn_rows = 0;
+                int current_vline = 0;
+
+                for (int r = 0; r < TERM_MAX_ROWS && drawn_rows < max_visible_rows; r++) {
+                    int real_r = (win->t_head + r) % TERM_MAX_ROWS; // LETTURA CIRCOLARE
+                    if (row_vlines[real_r] == 0) continue;
+
+                    char* str = win->t_history[real_r];
+                    int len = 0; while(str[len]) len++;
+                    int i = 0;
+
+                    while (i < len && drawn_rows < max_visible_rows) {
+                        int bp = len - i;
+                        if (bp > max_chars_per_line) {
+                            bp = max_chars_per_line;
+                            while(bp > 0 && str[i+bp] != ' ') bp--;
+                            if (bp == 0) bp = max_chars_per_line;
+                        }
+
+                        // Disegniamo solo se siamo scesi abbastanza da entrare nella "finestra visiva"
+                        if (current_vline >= top_visible_line) {
+                            char temp[150];
+                            for(int t=0; t<bp; t++) temp[t] = str[i+t];
+                            temp[bp] = '\0';
+                            
+                            draw_string(temp, term_x + 10, current_y, 0xFF00FF00, 1);
+                            current_y += 14;
+                            drawn_rows++;
+                        }
+
+                        current_vline++;
+                        i += bp;
+                        if (str[i] == ' ') i++;
+                    }
+                }
+
+                // 4. DISEGNO GRAFICA SCROLLBAR (Container Scavato Minimalista)
+                int sb_x = term_x + term_w - 20;
+                int sb_h = term_h;
+
+                // A. IL CANALE (Well) - Sfondo scavato continuo da cima a fondo
+                draw_textfield(sb_x, term_y, 20, sb_h, 0xFFE1E1E1);
+
+                // B. GLI INDICATORI DI SCORRIMENTO (Allineamento ottico corretto +1px a destra)
+                // Indicatore SU 
+                draw_rect(sb_x + 5, term_y + 9, 12, 2, 0xFF000000); 
+
+                // Indicatore GIU 
+                draw_rect(sb_x + 5, term_y + sb_h - 11, 12, 2, 0xFF000000);
+                
+
+
+                if (max_scrl > 0) {
+                    int track_h = sb_h - 40; 
+                    
+                    int thmb_h = (max_visible_rows * track_h) / total_vlines;
+                    if (thmb_h < 15) thmb_h = 15;
+                    if (thmb_h > track_h) thmb_h = track_h;
+
+                    int draggable_space = track_h - thmb_h;
+                    int y_offset = ((max_scrl - win->t_scroll) * draggable_space) / max_scrl;
+                    
+                    int thmb_y = term_y + 20 + y_offset;
+                    
+                    // =======================================================
+                    // SCROLLBAR THUMB (Stile Vetro Verticale Aqua Arrotondato)
+                    // =======================================================
+                    int t_x = sb_x + 2;
+                    int t_y = thmb_y;
+                    int t_w = 18; 
+                    int t_h = thmb_h;
+                    int half_w = t_w / 2;
+
+                    uint32_t thumb_color = 0xFFE3C6AA; // Colore Sabbia
+                    uint32_t line_color = 0xFFCFB298;  // Colore Linee Scanalate
+                    uint32_t shadow = 0xFF575757;
+                    uint32_t border_out = 0xFF808080;
+
+                    uint32_t br = (thumb_color >> 16) & 0xFF;
+                    uint32_t bg = (thumb_color >> 8) & 0xFF;
+                    uint32_t bb = thumb_color & 0xFF;
+
+                    // A. LENTE BASE VERTICALE
+                    for (int col = 1; col < t_w - 1; col++) {
+                        uint32_t r, g, b;
+                        if (col <= half_w) {
+                            uint32_t darken = 15 - ((col * 15) / half_w); 
+                            r = br - ((br * darken) / 100);
+                            g = bg - ((bg * darken) / 100);
+                            b = bb - ((bb * darken) / 100);
+                        } else {
+                            uint32_t lighten = (((col - half_w) * 45) / (t_w - half_w)); 
+                            r = br + ((255 - br) * lighten / 100);
+                            g = bg + ((255 - bg) * lighten / 100);
+                            b = bb + ((255 - bb) * lighten / 100);
+                        }
+                        draw_rect(t_x + col, t_y + 1, 1, t_h - 2, 0xFF000000 | (r << 16) | (g << 8) | b);
+                    }
+
+                    // B. GRIP LINES (3 scanalature orizzontali al centro)
+                    int center_y = t_y + (t_h / 2);
+                    if (t_h > 15) { // Le disegniamo solo se il cursore è abbastanza alto
+                        draw_rect(t_x + 3, center_y - 3, t_w - 6, 1, line_color);
+                        draw_rect(t_x + 3, center_y,     t_w - 6, 1, line_color);
+                        draw_rect(t_x + 3, center_y + 3, t_w - 6, 1, line_color);
+                    }
+
+                    // C. AQUA GLARE VERTICALE (Riflesso a sinistra)
+                    for (int col = 2; col <= half_w; col++) {
+                        uint32_t white_mix = 75 - ((col * 50) / half_w); 
+                        for (int row = 1; row < t_h - 1; row++) {
+                            // Leggiamo cosa c'è "sotto" (Linee + Fondo) e applichiamo la luce
+                            uint32_t cp = backbuffer[(t_y + row) * fb_width + (t_x + col)];
+                            uint32_t cr = (cp >> 16) & 0xFF;
+                            uint32_t cg = (cp >> 8) & 0xFF;
+                            uint32_t cb = cp & 0xFF;
+                            
+                            uint32_t gr = cr + ((255 - cr) * white_mix / 100);
+                            uint32_t gg = cg + ((255 - cg) * white_mix / 100);
+                            uint32_t gb = cb + ((255 - cb) * white_mix / 100);
+                            draw_pixel(t_x + col, t_y + row, 0xFF000000 | (gr << 16) | (gg << 8) | gb);
+                        }
+                    }
+
+                    // D. BORDI E RIFLESSI INTERNI
+                    uint32_t il_r = br + ((255 - br) * 60 / 100);
+                    uint32_t il_g = bg + ((255 - bg) * 60 / 100);
+                    uint32_t il_b = bb + ((255 - bb) * 60 / 100);
+                    uint32_t inner_light = 0xFF000000 | (il_r << 16) | (il_g << 8) | il_b;
+
+                    draw_rect(t_x + 4, t_y, t_w - 8, 1, border_out);              
+                    draw_rect(t_x, t_y + 4, 1, t_h - 8, border_out);             
+                    draw_rect(t_x + 4, t_y + t_h - 1, t_w - 8, 1, shadow); 
+                    draw_rect(t_x + t_w - 1, t_y + 4, 1, t_h - 8, shadow); 
+
+                    draw_rect(t_x + 2, t_y + 1, t_w - 4, 1, inner_light);         
+                    draw_rect(t_x + 1, t_y + 2, 1, t_h - 4, inner_light);        
+                    draw_rect(t_x + 2, t_y + t_h - 2, t_w - 4, 1, shadow); 
+                    draw_rect(t_x + t_w - 2, t_y + 2, 1, t_h - 4, shadow); 
+
+                    // E. CURVATURE DEGLI ANGOLI (Anti-aliasing Aqua)
+                    
+                    // Top-Left (Luce incidente)
+                    draw_pixel(t_x + 2, t_y + 1, border_out); draw_pixel(t_x + 3, t_y + 1, border_out);
+                    draw_pixel(t_x + 1, t_y + 2, border_out); draw_pixel(t_x + 1, t_y + 3, border_out);
+                    draw_pixel(t_x + 2, t_y + 2, inner_light); 
+                    
+                    // Top-Right (Raccordo nell'ombra, usa 'shadow' per ammorbidire!)
+                    draw_pixel(t_x + t_w - 3, t_y + 1, border_out); draw_pixel(t_x + t_w - 4, t_y + 1, border_out);
+                    draw_pixel(t_x + t_w - 2, t_y + 2, shadow);     draw_pixel(t_x + t_w - 2, t_y + 3, shadow);
+                    draw_pixel(t_x + t_w - 3, t_y + 2, shadow);
+
+                    // Bottom-Left (Chiude la luce a sinistra)
+                    draw_pixel(t_x + 1, t_y + t_h - 3, border_out); draw_pixel(t_x + 1, t_y + t_h - 4, border_out);
+                    draw_pixel(t_x + 2, t_y + t_h - 2, shadow);     draw_pixel(t_x + 3, t_y + t_h - 2, shadow);
+                    draw_pixel(t_x + 2, t_y + t_h - 3, shadow); 
+
+                    // Bottom-Right (Chiude l'ombra a destra)
+                    draw_pixel(t_x + t_w - 2, t_y + t_h - 3, shadow); draw_pixel(t_x + t_w - 2, t_y + t_h - 4, shadow);
+                    draw_pixel(t_x + t_w - 3, t_y + t_h - 2, shadow); draw_pixel(t_x + t_w - 4, t_y + t_h - 2, shadow);
+                    draw_pixel(t_x + t_w - 3, t_y + t_h - 3, shadow);
+                    // =======================================================
+                    
+                    // SALVIAMO I DATI PER IL TRASCINAMENTO
+                    win->t_max_scrl = max_scrl;
+                    win->t_thumb_y = thmb_y;
+                    win->t_thumb_h = thmb_h;
+                } else {
+                    win->t_max_scrl = 0; // Scroll disattivato
+                }
+                /*
+                if (max_scrl > 0) {
+                    int track_h = sb_h - 40; 
+                    
+                    int thmb_h = (max_visible_rows * track_h) / total_vlines;
+                    if (thmb_h < 15) thmb_h = 15;
+                    if (thmb_h > track_h) thmb_h = track_h;
+
+                    int draggable_space = track_h - thmb_h;
+                    int y_offset = ((max_scrl - win->t_scroll) * draggable_space) / max_scrl;
+                    
+                    int thmb_y = term_y + 20 + y_offset;
+                    draw_rect(sb_x + 2, thmb_y, 16, thmb_h, 0xFFFFFFFF); 
+                    
+                    // SALVIAMO I DATI PER IL TRASCINAMENTO
+                    win->t_max_scrl = max_scrl;
+                    win->t_thumb_y = thmb_y;
+                    win->t_thumb_h = thmb_h;
+                } else {
+                    win->t_max_scrl = 0; // Scroll disattivato
+                }
+                */
+                // --------------------------------------
+
+
+                // =======================================================
+                // VERIFICA SE UN'APP STA GIRANDO IN QUESTO TERMINALE
+                // =======================================================
+                int app_running_here = 0;
+                for(int p=1; p<MAX_PROCESSES; p++) {
+                    if (process_table[p].active && (process_table[p].linked_window == w || process_table[p].parent_window == w)) {
+                        app_running_here = 1; break;
+                    }
+                }
+
+                // Disegniamo la riga di comando SOLO se il terminale è libero
+                if (!app_running_here) {
+                    draw_string("OS> ", term_x + 10, term_y + term_h - 30, 0xFFFFFFFF, 1);
+                    
+                    // --- SCORRIMENTO ORIZZONTALE DINAMICO DELL'INPUT ---
+                    int max_input_chars = (term_w - 60) / 8;
+                    int start_idx = 0;
+                    if (win->t_cursor >= max_input_chars) start_idx = win->t_cursor - max_input_chars + 1;
+                    
+                    char temp_cmd[256]; 
+                    int cmd_idx = 0;
+                    for(int i = start_idx; i < win->t_len && cmd_idx < max_input_chars; i++) {
+                        temp_cmd[cmd_idx++] = win->t_buffer[i];
+                    }
+                    temp_cmd[cmd_idx] = '\0';
+                    
+                    draw_string(temp_cmd, term_x + 42, term_y + term_h - 30, 0xFFFFFFFF, 1);
+
+                    // --- CURSORE A BLOCCO INTERATTIVO ---
+                    int is_top = (w == top_app_win); 
+                    if (is_top && blink_counter < 50) {
+                        int cursor_pos_visibile = win->t_cursor - start_idx;
+                        if (cursor_pos_visibile >= 0 && cursor_pos_visibile <= max_input_chars) {
+                            int cursor_x = term_x + 42 + (cursor_pos_visibile * 8);
+                            int cursor_y = term_y + term_h - 30;
+                            
+                            draw_rect(cursor_x, cursor_y - 1, 8, 10, 0xFFFFFFFF);
+                            if (win->t_cursor < win->t_len) {
+                                char char_under = win->t_buffer[win->t_cursor];
+                                char temp_str[2] = {char_under, '\0'};
+                                draw_string(temp_str, cursor_x, cursor_y, 0xFF000000, 1);
+                            }
+                        }
+                    }
+                }
+
+            }
+
+            else if (win->type == WIN_TYPE_START_MENU) {
+                // IL MENU START (Stile Aqua Arrotondato con Vetro Laterale)
+                uint32_t bg_color = 0xFFE1E1E1;     
+                uint32_t light = 0xFFFFFFFF;        
+                uint32_t shadow = 0xFF808080;       
+                uint32_t dark = 0xFF000000;         
+                uint32_t banner_color = 0xFFE3C6AA; // Colore Sabbia Title Bar
+                uint32_t line_color = 0xFFCFB298;   // Colore linee (finestra inattiva)
+
+                // 1. Sfondo Centrale Arrotondato
+                draw_rect(win->x + 2, win->y + 2, win->w - 4, win->h - 4, bg_color);
+
+                // ==========================================================
+                // 2. MAGIA: FASCIA LATERALE IN VETRO AQUA VERTICALE
+                // (Esatto clone ruotato a 90° della funzione draw_button!)
+                // ==========================================================
+                int b_start_x = win->x + 2;
+                int b_start_y = win->y + 2;
+                int b_w = 26; 
+                int b_h = win->h - 4;
+                int half_w = b_w / 2;
+
+                uint32_t br = (banner_color >> 16) & 0xFF;
+                uint32_t bg = (banner_color >> 8) & 0xFF;
+                uint32_t bb = banner_color & 0xFF;
+
+                // A. LENTE DI BASE (Gradiente: si scurisce verso il centro, si schiarisce a destra)
+                for (int col = 1; col < b_w - 1; col++) {
+                    uint32_t r, g, b, col_color;
+                    
+                    if (col <= half_w) {
+                        uint32_t darken = 15 - ((col * 15) / half_w); 
+                        r = br - ((br * darken) / 100);
+                        g = bg - ((bg * darken) / 100);
+                        b = bb - ((bb * darken) / 100);
+                    } else {
+                        uint32_t lighten = (((col - half_w) * 45) / (b_w - half_w)); 
+                        r = br + ((255 - br) * lighten / 100);
+                        g = bg + ((255 - bg) * lighten / 100);
+                        b = bb + ((255 - bb) * lighten / 100);
+                    }
+                    col_color = 0xFF000000 | (r << 16) | (g << 8) | b;
+                    draw_rect(b_start_x + col, b_start_y, 1, b_h, col_color);
+                }
+
+                // B. LINEE DECORATIVE (Incisiamo le linee dentro la lente base)
+                for (int ly = win->y + 8; ly < win->y + win->h - 8; ly += 5) {
+                    draw_rect(b_start_x + 2, ly, b_w - 4, 1, line_color);
+                }
+
+                // C. AQUA GLARE (Riflesso abbagliante a sinistra: si fonde con le linee e il fondo)
+                for (int col = 2; col <= half_w; col++) {
+                    uint32_t white_mix = 75 - ((col * 50) / half_w); // Stessa formula dei bottoni!
+                    
+                    for (int row = 0; row < b_h; row++) {
+                        // Leggiamo la RAM video per catturare sia le linee che la lente base
+                        uint32_t cp = backbuffer[(b_start_y + row) * fb_width + (b_start_x + col)];
+                        uint32_t cr = (cp >> 16) & 0xFF;
+                        uint32_t cg = (cp >> 8) & 0xFF;
+                        uint32_t cb = cp & 0xFF;
+                        
+                        // Applichiamo l'illuminazione Aqua
+                        uint32_t gr = cr + ((255 - cr) * white_mix / 100);
+                        uint32_t gg = cg + ((255 - cg) * white_mix / 100);
+                        uint32_t gb = cb + ((255 - cb) * white_mix / 100);
+                        
+                        draw_pixel(b_start_x + col, b_start_y + row, 0xFF000000 | (gr << 16) | (gg << 8) | gb);
+                    }
+                }
+
+                // D. RIFLESSO INTERNO E OMBRA ESTERNA (Sigilliamo il cilindro di vetro)
+                uint32_t il_r = br + ((255 - br) * 60 / 100);
+                uint32_t il_g = bg + ((255 - bg) * 60 / 100);
+                uint32_t il_b = bb + ((255 - bb) * 60 / 100);
+                uint32_t inner_light = 0xFF000000 | (il_r << 16) | (il_g << 8) | il_b;
+                
+                draw_rect(b_start_x, b_start_y, 1, b_h, inner_light);       // Luce netta a sinistra
+                draw_rect(b_start_x + 1, b_start_y, 1, b_h, inner_light);   // Spessore luce
+                draw_rect(b_start_x + b_w - 2, b_start_y, 1, b_h, shadow);  // Ombra sfumata a destra
+                draw_rect(b_start_x + b_w - 1, b_start_y, 1, b_h, shadow);  // Confine netto col menu grigio
+                // ==========================================================
+
+                // 3. Bordi Esterni (Arrotondamento a 4 pixel)
+                draw_rect(win->x + 4, win->y, win->w - 8, 1, light);              
+                draw_rect(win->x, win->y + 4, 1, win->h - 8, light);             
+                draw_rect(win->x + 4, win->y + win->h - 1, win->w - 8, 1, dark);  
+                draw_rect(win->x + win->w - 1, win->y + 4, 1, win->h - 8, dark);  
+
+                // 4. Bordi Interni (Profondità 3D)
+                draw_rect(win->x + 4, win->y + 1, win->w - 8, 1, light);          
+                draw_rect(win->x + 1, win->y + 4, 1, win->h - 8, light);         
+                draw_rect(win->x + 4, win->y + win->h - 2, win->w - 8, 1, shadow); 
+                draw_rect(win->x + win->w - 2, win->y + 4, 1, win->h - 8, shadow); 
+
+                // 5. SCOLPITURA ANGOLI
+                // Top-Left (Non coloriamo i pixel interni perché sono già del vetro!)
+                draw_pixel(win->x + 2, win->y + 1, light); draw_pixel(win->x + 3, win->y + 1, light);
+                draw_pixel(win->x + 1, win->y + 2, light); draw_pixel(win->x + 1, win->y + 3, light);
+                
+                // Top-Right
+                draw_pixel(win->x + win->w - 3, win->y + 1, light); draw_pixel(win->x + win->w - 4, win->y + 1, light);
+                draw_pixel(win->x + win->w - 2, win->y + 2, dark);  draw_pixel(win->x + win->w - 2, win->y + 3, dark);
+                draw_pixel(win->x + win->w - 3, win->y + 2, light); draw_pixel(win->x + win->w - 3, win->y + 3, shadow);
+                
+                // Bottom-Left (Non coloriamo i pixel interni perché sono già del vetro!)
+                draw_pixel(win->x + 1, win->y + win->h - 4, light); draw_pixel(win->x + 1, win->y + win->h - 3, light);
+                draw_pixel(win->x + 2, win->y + win->h - 2, dark);  draw_pixel(win->x + 3, win->y + win->h - 2, dark);
+                
+                // Bottom-Right
+                draw_pixel(win->x + win->w - 2, win->y + win->h - 4, dark); draw_pixel(win->x + win->w - 2, win->y + win->h - 3, dark);
+                draw_pixel(win->x + win->w - 3, win->y + win->h - 2, dark); draw_pixel(win->x + win->w - 4, win->y + win->h - 2, dark);
+                draw_pixel(win->x + win->w - 3, win->y + win->h - 4, shadow); draw_pixel(win->x + win->w - 3, win->y + win->h - 3, shadow);
+
+                // --- 6. BANNER LATERALE: TESTO "ANTE MILLENNIUM" ---
+                const char* banner_text = "ANTE MILLENNIUM";
+                int banner_y = win->y + 13; 
+                for (int b = 0; banner_text[b] != '\0'; b++) {
+                    if (banner_text[b] == ' ') { banner_y += 10; continue; }
+                    char temp_letter[2] = {banner_text[b], '\0'};
+                    int char_w = font_prop[(unsigned char)banner_text[b]].width;
+                    // Centrato nella nuova fascia larga 26px
+                    int l_x = win->x + 2 + (26 - char_w) / 2; 
+                    draw_prop_string_bold(temp_letter, l_x, banner_y, 0xFF000000); 
+                    banner_y += 11; 
+                }
+
+                // --- 7. VOCI DEL MENU ---
+                int start_x = win->x + 28; int item_w = win->w - 32;
+                int icon_x = win->x + 32; int text_x = win->x + 55;
+
+                draw_icon_16(2, icon_x, win->y + 17);
+                draw_prop_string_bold("File Manager", text_x, win->y + 17, 0xFF808080);
+
+                // HOVER "Terminal"
+                if (mouse_x >= start_x && mouse_x <= start_x + item_w && mouse_y >= win->y + 40 && mouse_y < win->y + 70) {
+                    draw_rect(start_x, win->y + 40, item_w, 30, 0xFFCFB298); 
+                    for (int ly = win->y + 41; ly < win->y + 70; ly += 3) {  
+                        draw_rect(start_x, ly, item_w, 1, 0xFFE3C6AA);       
+                    }
+                    draw_icon_16(1, icon_x, win->y + 47); 
+                    draw_prop_string_bold("Terminal", text_x, win->y + 47, 0xFF000000); 
+                } else {
+                    draw_icon_16(1, icon_x, win->y + 47); draw_prop_string_bold("Terminal", text_x, win->y + 47, 0xFF000000); 
+                }
+
+                // HOVER "Applications >>"
+                if (mouse_x >= start_x && mouse_x <= start_x + item_w && mouse_y >= win->y + 70 && mouse_y < win->y + 100) {
+                    draw_rect(start_x, win->y + 70, item_w, 30, 0xFFCFB298); 
+                    for (int ly = win->y + 71; ly < win->y + 100; ly += 3) { 
+                        draw_rect(start_x, ly, item_w, 1, 0xFFE3C6AA);       
+                    }
+                    draw_icon_16(3, icon_x, win->y + 77); 
+                    draw_prop_string_bold("Applications >>", text_x, win->y + 77, 0xFF000000); 
+                } else {
+                    draw_icon_16(3, icon_x, win->y + 77); draw_prop_string_bold("Applications >>", text_x, win->y + 77, 0xFF000000);
+                }
+
+                draw_icon_16(4, icon_x, win->y + 107);
+                draw_prop_string_bold("Settings", text_x, win->y + 107, 0xFF808080);
+                draw_rect(win->x + 30, win->y + 140, win->w - 32, 1, 0xFF808080);
+                draw_rect(win->x + 30, win->y + 141, win->w - 32, 1, 0xFFFFFFFF);
+                draw_icon_16(5, icon_x, win->y + 155);
+                draw_prop_string_bold("Exit", text_x, win->y + 155, 0xFF808080);
+            }
+
+            else if (win->type == WIN_TYPE_APP_GUI) {
+                // 1. Coordinate Logiche (Intatte per non sfasare i bottoni delle App)
+                int app_x = win->x + 4;
+                int app_y = win->y + 32; 
+                
+                // 2. Coordinate Fisiche della Tela (Incastro perfetto a 1px)
+                int canvas_x = win->x + 1;
+                int canvas_y = win->y + 32;
+                int canvas_w = win->w - 2;
+                int canvas_h = win->h - 33; 
+                
+                uint32_t bg_color = 0xFFFFFFFF; // Bianco Puro
+
+                // ========================================================================
+                // A. SFONDO CENTRALE PINSTRIPE (Righe da 2 pixel)
+                // ========================================================================
+                draw_rect(canvas_x, canvas_y, canvas_w, canvas_h, bg_color);
+
+                uint32_t pinstripe_color = 0xFFE8E8E8; 
+                
+                // PASSO DI 4 PIXEL: Disegna 2 pixel di riga grigia e lascia 2 pixel di spazio bianco!
+                for (int ly = canvas_y + 2; ly < canvas_y + canvas_h; ly += 4) {
+                    int h = 2; // Spessore della linea aumentato a 2 pixel
+                    
+                    // Sicurezza: se la linea sborda fuori dal basso della finestra, la tagliamo
+                    if (ly + h > canvas_y + canvas_h) h = (canvas_y + canvas_h) - ly;
+                    
+                    draw_rect(canvas_x, ly, canvas_w, h, pinstripe_color);
+                }
+
+                // IL BLOCCO "B" DEI VECCHI ANGOLI INFERIORI È STATO ELIMINATO!
+                // La finestra è squadrata e pulita.
+                
+                
+                
+                
+                
+                // Disegna tutto quello che l'App ha ordinato nella sua Display List
+                for(int e = 0; e < win->ui_count; e++) {
+                    gui_element_t* el = &win->ui_elements[e];
+                    int ex = app_x + el->x;
+                    int ey = app_y + el->y;
+                    
+                    if (el->type == 1) { // 1 = Pannello Satinato Dinamico
+                        uint32_t p_br = (el->color1 >> 16) & 0xFF;
+                        uint32_t p_bg = (el->color1 >> 8) & 0xFF;
+                        uint32_t p_bb = el->color1 & 0xFF;
+
+                        // Clipping di sicurezza per non disegnare fuori dal monitor
+                        int p_sx = ex; if (p_sx < 0) p_sx = 0;
+                        int p_sy = ey; if (p_sy < 0) p_sy = 0;
+                        int p_ex = ex + el->w; if (p_ex > fb_width) p_ex = fb_width;
+                        int p_ey = ey + el->h; if (p_ey > fb_height) p_ey = fb_height;
+
+                        for (int py = p_sy; py < p_ey; py++) {
+                            uint32_t* row_ptr = &backbuffer[py * fb_width];
+                            for (int px = p_sx; px < p_ex; px++) {
+                                // Mappiamo la texture usando le coordinate relative al pannello
+                                uint32_t rel_x = px - ex; 
+                                uint32_t rel_y = py - ey;
+                                uint32_t n = rel_x + (rel_y * 57325);
+                                n = (n << 13) ^ n;
+                                uint32_t nn = (n * (n * n * 15731 + 789221) + 1376312589);
+                                
+                                // Escursione di +/- 18 sul colore base
+                                int shift = ((nn % 7) - 3) * 6; 
+                                
+                                int mod_r = p_br + shift;
+                                int mod_g = p_bg + shift;
+                                int mod_b = p_bb + shift;
+                                
+                                // Clipping anti-corruzione per colori estremi (bianco o nero)
+                                if (mod_r < 0) mod_r = 0; else if (mod_r > 255) mod_r = 255;
+                                if (mod_g < 0) mod_g = 0; else if (mod_g > 255) mod_g = 255;
+                                if (mod_b < 0) mod_b = 0; else if (mod_b > 255) mod_b = 255;
+
+                                row_ptr[px] = 0xFF000000 | (mod_r << 16) | (mod_g << 8) | mod_b;
+                            }
+                        }
+                    }
+                    else if (el->type == 2) { // 2 = Bottone 3D
+                        // Rileviamo se il mouse sta fisicamente premendo QUESTO bottone
+                        int is_pressed = 0;
+                        if (is_clicking && w == top_app_win && mouse_x >= ex && mouse_x <= ex + el->w && mouse_y >= ey && mouse_y <= ey + el->h) {
+                            is_pressed = 1;
+                        }
+                        
+                        uint32_t btn_bg = el->color1;
+                        uint32_t light = 0xFFFFFFFF;
+                        uint32_t shadow = 0xFF575757;
+                        
+                        // EFFETTO PRESSIONE: Scuriamo il colore base del 25% matematicamente
+                        if (is_pressed) {
+                            uint32_t r = ((btn_bg >> 16) & 0xFF) * 75 / 100;
+                            uint32_t g = ((btn_bg >> 8) & 0xFF) * 75 / 100;
+                            uint32_t b = (btn_bg & 0xFF) * 75 / 100;
+                            btn_bg = 0xFF000000 | (r << 16) | (g << 8) | b;
+                            
+                            light = 0xFFC0C0C0; // Attenuiamo il riflesso superiore
+                        }
+                        
+                        draw_button(ex, ey, el->w, el->h, btn_bg, light, shadow);
+                        
+                        // =======================================================
+                        // TESTO DEL BOTTONE (Fisso, incollato sotto al vetro!)
+                        // =======================================================
+                        int text_width_px = get_prop_string_width_bold(el->text);
+                        int text_x = ex + (el->w / 2) - (text_width_px / 2);
+                        int text_y = ey + (el->h / 2) - 8; 
+                        
+                        draw_prop_string_bold(el->text, text_x, text_y, el->color2);
+                    }
+
+                    else if ((el->type & 0xFF) == 3) { // 3 = Testo Libero
+                        // Se il bit 0x0400 è acceso, usa la funzione Bold
+                        if (el->type & 0x0400) {
+                            draw_prop_string_bold(el->text, ex, ey, el->color1);
+                        } else {
+                            draw_prop_string(el->text, ex, ey, el->color1);
+                        }
+                    }
+                    
+                    else if (el->type == 4) {
+                        draw_textfield(ex, ey, el->w, el->h, el->color1); 
+                        
+                        // 1. Calcoliamo la larghezza del testo fino al cursore
+                        int cursor_offset = 0;
+                        for (int k = 0; k < focused_cursor_pos && el->text[k] != '\0'; k++) {
+                            unsigned char uc = (unsigned char)el->text[k];
+                            if (uc < 128) {
+                                if (uc == ' ') cursor_offset += 5;
+                                else cursor_offset += font_prop[uc].width + 1;
+                            } else cursor_offset += 8;
+                        }
+                        
+                        // 2. Calcolo Scorrimento Orizzontale (Scroll_X)
+                        int text_area_w = el->w - 8; 
+                        int scroll_x = 0;
+                        
+                        // Solo se questa textbox ha il focus ed è in uso, la facciamo scorrere
+                        if (w == top_app_win && focused_window_id == w && focused_element_idx == e) {
+                            if (cursor_offset > text_area_w - 12) {
+                                scroll_x = cursor_offset - (text_area_w - 12); // Spingiamo il testo a sinistra
+                            }
+                        }
+
+                        // 3. DISEGNO TESTO TAGLIATO SUI BORDI (Clipping)
+                        draw_prop_string_clipped(el->text, ex + 4 - scroll_x, ey + 4, 0xFF000000, ex + 2, ey + 2, el->w - 4, el->h - 4);
+                        
+                        // =======================================================
+                        // 4. DISEGNO DEL CURSORE A BLOCCO (Proporzionale NATIVO)
+                        // =======================================================
+                        if (w == top_app_win && focused_window_id == w && focused_element_idx == e && blink_counter < 50) {
+                            
+                            int cx = ex + 4 + cursor_offset - scroll_x;
+                            int cy = ey + 4;
+                            char char_under_cursor = el->text[focused_cursor_pos];
+                            
+                            int block_w = 8; 
+                            if (char_under_cursor != '\0' && (unsigned char)char_under_cursor < 128) {
+                                if (char_under_cursor == ' ') block_w = 5;
+                                else block_w = font_prop[(unsigned char)char_under_cursor].width + 1;
+                            }
+                            
+                            // Disegniamo il blocco SOLO se non sborda fuori dai margini della scatola
+                            if (cx >= ex + 2 && cx + block_w <= ex + el->w - 2) {
+                                draw_rect(cx, cy, block_w, 16, 0xFF000000);
+                                
+                                // Invertiamo il colore stampandoci sopra (sempre col clipping!)
+                                if (char_under_cursor != '\0') {
+                                    char temp_str[2] = {char_under_cursor, '\0'};
+                                    draw_prop_string_clipped(temp_str, cx, cy, 0xFFFFFFFF, ex + 2, ey + 2, el->w - 4, el->h - 4);
+                                }
+                            }
+                        }
+                    }
+
+
+
+                    else if (el->type == 5) { // 5 = IMMAGINE RAW a 32-bit
+                        // 1. Cerchiamo chi è il proprietario di questa finestra
+                        int app_pid = -1;
+                        for(int p=1; p<MAX_PROCESSES; p++) {
+                            if (process_table[p].active && process_table[p].linked_window == w) app_pid = p;
+                        }
+
+                        if (app_pid > 0) {
+                            // ==========================================
+                            // INIZIO SEZIONE CRITICA (Protezione Timer)
+                            // Salviamo lo stato attuale del processore e disattiviamo gli interrupt!
+                            // ==========================================
+                            uint32_t flags;
+                            asm volatile("pushf \n pop %0 \n cli" : "=r"(flags));
+
+                            // 2. MAGIA: Colleghiamo il cervello del Kernel alla RAM privata di questa specifica App
+                            page_directory[256] = ((uint32_t)process_table[app_pid].page_table) | 0x07;
+                            asm volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax"); // Flush TLB
+
+                            // 3. Ora possiamo leggere l'immagine in totale sicurezza
+                            uint32_t* pixels = (uint32_t*)el->color1;
+                            for (int iy = 0; iy < el->h; iy++) {
+                                for (int ix = 0; ix < el->w; ix++) {
+                                    draw_pixel(ex + ix, ey + iy, pixels[iy * el->w + ix]);
+                                }
+                            }
+
+                            // 4. Ripristiniamo la RAM dell'App attualmente in esecuzione nello scheduler
+                            if (current_pid > 0) page_directory[256] = ((uint32_t)process_table[current_pid].page_table) | 0x07;
+                            else page_directory[256] = 0;
+                            asm volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax"); // Flush TLB
+
+                            // ==========================================
+                            // FINE SEZIONE CRITICA
+                            // Ripristiniamo gli interrupt esattamente come li avevamo trovati!
+                            // ==========================================
+                            asm volatile("push %0 \n popf" :: "r"(flags));
+                        }
+                    }
+                }
+            }
+            else if (win->type == WIN_TYPE_APP_MENU) {
+                // Sfondo sottomenu (Nuovo stile Aqua Rounded)
+                uint32_t bg_color = 0xFFE1E1E1;
+                uint32_t light = 0xFFFFFFFF;
+                uint32_t shadow = 0xFF808080;
+                uint32_t dark = 0xFF000000;
+
+                // 1. Sfondo e Bordi Arrotondati
+                draw_rect(win->x + 2, win->y + 2, win->w - 4, win->h - 4, bg_color);
+                draw_rect(win->x + 4, win->y, win->w - 8, 1, light);
+                draw_rect(win->x, win->y + 4, 1, win->h - 8, light);
+                draw_rect(win->x + 4, win->y + win->h - 1, win->w - 8, 1, dark);
+                draw_rect(win->x + win->w - 1, win->y + 4, 1, win->h - 8, dark);
+                
+                draw_rect(win->x + 4, win->y + 1, win->w - 8, 1, light);
+                draw_rect(win->x + 1, win->y + 4, 1, win->h - 8, light);
+                draw_rect(win->x + 4, win->y + win->h - 2, win->w - 8, 1, shadow);
+                draw_rect(win->x + win->w - 2, win->y + 4, 1, win->h - 8, shadow);
+
+                // 2. Angoli
+                draw_pixel(win->x + 2, win->y + 1, light); draw_pixel(win->x + 3, win->y + 1, light);
+                draw_pixel(win->x + 1, win->y + 2, light); draw_pixel(win->x + 1, win->y + 3, light);
+                draw_pixel(win->x + win->w - 3, win->y + 1, light); draw_pixel(win->x + win->w - 2, win->y + 2, dark);
+                draw_pixel(win->x + 1, win->y + win->h - 3, light); draw_pixel(win->x + 2, win->y + win->h - 2, dark);
+                draw_pixel(win->x + win->w - 2, win->y + win->h - 3, dark); draw_pixel(win->x + win->w - 3, win->y + win->h - 2, dark);
+
+                // --- BARRA DI RICERCA ---
+                draw_textfield(win->x + 6, win->y + 6, win->w - 12, 24, 0xFFFFFFFF);
+                draw_prop_string("Cerca app...", win->x + 12, win->y + 10, 0xFF808080);
+                draw_icon_16(6, win->x + win->w - 26, win->y + 10);
+
+                // --- LISTA APPLICAZIONI ---
+                int list_start_y = win->y + 34; int item_height = 22;
+                int visible_items = (win->h - 38) / item_height;
+                int total_items = win->t_len;
+
+                for (int i = 0; i < visible_items; i++) {
+                    int item_idx = win->t_scroll + i;
+                    if (item_idx >= total_items) break;
+                    int item_y = list_start_y + (i * item_height);
+
+                    // EFFETTO HOVER MAGIC (ZIGRINATO TONO SU TONO)
+                    if (mouse_x >= win->x + 4 && mouse_x <= win->x + win->w - 24 && mouse_y >= item_y && mouse_y < item_y + item_height) {
+                        draw_rect(win->x + 4, item_y, win->w - 28, item_height, 0xFFCFB298); // Sfondo Sabbia Scuro
+                        for (int ly = item_y + 1; ly < item_y + item_height; ly += 3) {      
+                            draw_rect(win->x + 4, ly, win->w - 28, 1, 0xFFE3C6AA);           // Linee Sabbia Chiaro
+                        }
+                        draw_prop_string_bold(win->t_history[item_idx], win->x + 12, item_y + 3, 0xFF000000); // Testo Nero
+                    } else {
+                        draw_prop_string_bold(win->t_history[item_idx], win->x + 12, item_y + 3, 0xFF000000); 
+                    }
+                    draw_rect(win->x + 6, item_y + item_height - 1, win->w - 32, 1, 0xFFC0C0C0);
+                }
+
+                // --- SCROLLBAR ---
+                int sb_x = win->x + win->w - 22; 
+                draw_rect(sb_x, list_start_y, 18, win->h - 38, 0xFF808080);
+                if (total_items > visible_items) {
+                    int thmb_h = (visible_items * (win->h - 38)) / total_items;
+                    int y_off = (win->t_scroll * ((win->h - 38) - thmb_h)) / (total_items - visible_items);
+                    draw_button(sb_x + 2, list_start_y + y_off, 14, thmb_h, 0xFFC0C0C0, 0xFFFFFFFF, 0xFF000000);
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // RENDERING TASKBAR ANIMATA (LARGHEZZA DINAMICA CENTRATA)
+    // ========================================================================
+    int tb_y = fb_height - 30 - taskbar_y_offset; 
+
+    // 1. Calcolo Dinamico del Target di Larghezza
+    int max_tb_w = fb_width - 20; // Dimensione massima (larga quasi tutto lo schermo)
+    int min_tb_w = 220;           // Dimensione minima di avvio (Menu + Info + Orologio)
+    
+    int valid_wins[MAX_WINDOWS];
+    int valid_count = get_taskbar_windows(valid_wins);
+    
+    // Ogni applicazione aperta aggiunge 165 pixel di respiro alla barra
+    taskbar_target_w = min_tb_w + (valid_count * 165);
+    if (taskbar_target_w > max_tb_w) taskbar_target_w = max_tb_w;
+
+    // 2. Geometria Attuale della Barra (in base allo step di animazione)
+    int tb_w = taskbar_w;
+    int tb_x = (fb_width - tb_w) / 2; // Centratura orizzontale perfetta e automatica
+
+    // Sfondo barra (Piedistallo Grigio Titanio che si espande dal centro)
+    draw_button(tb_x, tb_y + 15, tb_w, 15, 0xFF6E6E6E, 0xFFFFFFFF, 0xFF000000);
+    
+        // ========================================================================
+    // PULSANTE MENU: FASCIO DI LUCE (Ancorato al bordo sinistro dinamico)
+    // ========================================================================
+    uint32_t bg_current = 0xFFA9BCC6; 
+    uint32_t neon_base = 0xFFE3C6AA;  
+    uint32_t beam_white = 0xFFFFFFFF; 
+    
+    int start_x = tb_x + 7; // Segue fedelmente l'espansione sinistra della barra!
+    int start_w = 80;
+
+    int is_pressed = (mouse_x >= start_x && mouse_x <= start_x + start_w && mouse_y >= tb_y && mouse_y <= tb_y + 26 && is_clicking);
+    uint32_t current_mid_color = is_pressed ? neon_base : beam_white;
+
+    draw_rect(start_x, tb_y + 23, start_w, 1, beam_white);
+    for (int i = 0; i < 5; i++) {
+        int r1 = 255, g1 = 255, b1 = 255; 
+        int r2 = (current_mid_color >> 16) & 0xFF, g2 = (current_mid_color >> 8) & 0xFF, b2 = current_mid_color & 0xFF; 
+        int r = r1 + (r2 - r1) * i / 5;
+        int g = g1 + (g2 - g1) * i / 5;
+        int b = b1 + (b2 - b1) * i / 5;
+        draw_rect(start_x + 2, (tb_y + 22) - i, start_w - 4, 1, (0xFF000000 | (r << 16) | (g << 8) | b));
+    }
+    draw_rect(start_x + 2, tb_y + 13, start_w - 4, 5, current_mid_color);
+
+    for (int i = 0; i < 13; i++) {
+        int r1 = 255, g1 = 255, b1 = 255; 
+        int r2 = (bg_current >> 16) & 0xFF, g2 = (bg_current >> 8) & 0xFF, b2 = bg_current & 0xFF; 
+        int r = r1 + (r2 - r1) * i / 13;
+        int g = g1 + (g2 - g1) * i / 13;
+        int b = b1 + (b2 - b1) * i / 13;
+        draw_rect(start_x + 2, (tb_y + 12) - i, start_w - 4, 1, (0xFF000000 | (r << 16) | (g << 8) | b));
+    }
+
+    // --- CENTRATURA PERFETTA LOGO E TESTO "Main" ---
+    // Calcoliamo l'ingombro del testo e sommiamo la larghezza del logo (24px) + 5px di respiro
+    int main_str_w = get_prop_string_width_bold("Main");
+    int combined_w = 24 + 5 + main_str_w; 
+    int content_start_x = start_x + (start_w - combined_w) / 2;
+
+    draw_os_logo(content_start_x, tb_y + 7); 
+    draw_prop_string_bold("Main", content_start_x + 29, tb_y + 5, 0xFF000000);
+
+    // ========================================================================
+    // OROLOGIO ANALOGICO E INFO (Ancorati a destra, Layout Rettangolare)
+    // ========================================================================
+    read_rtc();
+    static const int clk_dx[60] = {
+        0, 104, 207, 309, 406, 500, 587, 669, 743, 809, 866, 913, 951, 978, 994,
+        1000, 994, 978, 951, 913, 866, 809, 743, 669, 587, 500, 406, 309, 207, 104,
+        0, -104, -207, -309, -406, -500, -587, -669, -743, -809, -866, -913, -951, -978, -994,
+        -1000, -994, -978, -951, -913, -866, -809, -743, -669, -587, -500, -406, -309, -207, -104
+    };
+    static const int clk_dy[60] = {
+        -1000, -994, -978, -951, -913, -866, -809, -743, -669, -587, -500, -406, -309, -207, -104,
+        0, 104, 207, 309, 406, 500, 587, 669, 743, 809, 866, 913, 951, 978, 994,
+        1000, 994, 978, 951, 913, 866, 809, 743, 669, 587, 500, 406, 309, 207, 104,
+        0, -104, -207, -309, -406, -500, -587, -669, -743, -809, -866, -913, -951, -978, -994
+    };
+
+    // L'orologio mantiene l'ingombro di 26x26 pixel, posizionato a 33px dal margine destro
+    int clock_w = 26;
+    int clock_h = 26;
+    int clock_x = (tb_x + tb_w) - 33; 
+    int clock_y = tb_y;          
+    int cx = clock_x + 13; // Centro per le lancette      
+    int cy = clock_y + 13;       
+
+    // 1. Sfondo Orologio: Bordo nero esterno perfettametne squadrato e interno bianco
+    draw_rect(clock_x, clock_y, clock_w, clock_h, 0xFF000000);
+    draw_rect(clock_x + 1, clock_y + 1, clock_w - 2, clock_h - 2, 0xFFFFFFFF);
+
+    // Calcolo e Disegno Lancette (Invariato)
+    int s_idx = rtc_second % 60;
+    int m_idx = rtc_minute % 60;
+    int h_idx = ((rtc_hour % 12) * 5) + (rtc_minute / 12); 
+
+    for (int l = 0; l <= 6; l++) {
+        int hx = cx + (clk_dx[h_idx] * l) / 1000; int hy = cy + (clk_dy[h_idx] * l) / 1000;
+        draw_pixel(hx, hy, 0xFF000000); draw_pixel(hx + 1, hy, 0xFF000000); 
+        draw_pixel(hx, hy + 1, 0xFF000000); draw_pixel(hx + 1, hy + 1, 0xFF000000);
+    }
+    for (int l = 0; l <= 10; l++) {
+        int mx = cx + (clk_dx[m_idx] * l) / 1000; int my = cy + (clk_dy[m_idx] * l) / 1000;
+        draw_pixel(mx, my, 0xFF000000); if (l < 6) draw_pixel(mx + 1, my, 0xFF000000); 
+    }
+    for (int l = 0; l <= 12; l++) {
+        int sx = cx + (clk_dx[s_idx] * l) / 1000; int sy = cy + (clk_dy[s_idx] * l) / 1000;
+        draw_pixel(sx, sy, 0xFFFF0000); 
+    }
+    draw_pixel(cx, cy, 0xFFFF0000); draw_pixel(cx + 1, cy, 0xFFFF0000);
+
+    // ========================================================================
+    // PULSANTE "INFO" (Gemello Rettangolare a sinistra dell'orologio)
+    // ========================================================================
+    int info_w = 26;
+    int info_h = 26;
+    int info_x = clock_x - info_w - 10; 
+    int info_y = tb_y;
+    int icx = info_x + 13; // Centro per la 'i'
+    int icy = info_y + 13; 
+
+    // Hitbox e Colore Dinamico
+    uint32_t info_bg = 0xFF0066CC; 
+    if (mouse_x >= info_x && mouse_x <= info_x + info_w && mouse_y >= info_y && mouse_y <= info_y + info_h && is_clicking) {
+        info_bg = 0xFF004499; 
+    }
+    
+    // Sfondo Info: Bordo nero squadrato e interno blu dinamico
+    draw_rect(info_x, info_y, info_w, info_h, 0xFF000000);
+    draw_rect(info_x + 1, info_y + 1, info_w - 2, info_h - 2, info_bg);
+
+    // Disegno della 'i' corsiva bianca (perfettamente centrata)
+    draw_rect(icx + 2, icy - 6, 2, 2, 0xFFFFFFFF); 
+    draw_rect(icx + 1, icy - 2, 2, 2, 0xFFFFFFFF);
+    draw_rect(icx + 0, icy + 0, 2, 2, 0xFFFFFFFF);
+    draw_rect(icx - 1, icy + 2, 2, 2, 0xFFFFFFFF);
+    draw_rect(icx - 2, icy + 4, 2, 3, 0xFFFFFFFF);
+
+    // ========================================================================
+    // AREA PULSANTI DELLE APP (Adattiva con Centratura e Separatore)
+    // ========================================================================
+    int tb_start_x = start_x + start_w + 8; // Inizia subito dopo il Menu
+    
+    // AGGIORNAMENTO: L'area per i bottoni termina prima del limite massimo del separatore!
+    // (info_x - 15 è il centro del separatore, togliamo altri 12px per non toccarne il bordo)
+    int tb_end_x = (info_x - 15) - 12;      
+    int tb_area_w = tb_end_x - tb_start_x;
+
+    int actual_btn_w_calc = 0;
+
+    if (valid_count > 0 && tb_area_w > 10) {
+        int btn_w = tb_area_w / valid_count;
+        if (btn_w > 160) btn_w = 160; 
+        actual_btn_w_calc = btn_w;
+        
+        for(int i = 0; i < valid_count; i++) {
+            int w_id = valid_wins[i];
+            int bx = tb_start_x + (i * btn_w);
+            int by = tb_y; 
+            
+            if (btn_w > 30) {
+                int is_active_win = (global_active_win == w_id && !windows[w_id].is_minimized);
+                
+                if (is_active_win) draw_button(bx, by, btn_w - 4, 26, 0xFFA68A70, 0xFFFFFFFF, 0xFF575757); 
+                else draw_button(bx, by, btn_w - 4, 26, 0xFFCFB298, 0xFFFFFFFF, 0xFF575757);
+
+                // Centratura dinamica Icona e Testo
+                int actual_btn_w = btn_w - 4;
+                int max_text_px = actual_btn_w - 8 - 20; 
+                
+                char short_title[32]; 
+                int t_len = 0;
+                int current_str_px = 0;
+                
+                while(windows[w_id].title[t_len] != '\0' && t_len < 31) {
+                    unsigned char uc = (unsigned char)windows[w_id].title[t_len];
+                    int char_w = (uc < 128) ? (uc == ' ' ? 6 : font_prop[uc].width + 2) : 9;
+                    
+                    if (current_str_px + char_w > max_text_px) break;
+                    short_title[t_len] = windows[w_id].title[t_len];
+                    current_str_px += char_w;
+                    t_len++;
+                }
+                short_title[t_len] = '\0';
+                
+                int content_w = 16 + (t_len > 0 ? 4 + current_str_px : 0);
+                int content_start_x = bx + (actual_btn_w - content_w) / 2;
+                
+                draw_icon_16(windows[w_id].icon_id, content_start_x, by + 5);
+                
+                if (t_len > 0) {
+                    uint32_t btn_text_color = is_active_win ? 0xFFFFFFFF : 0xFF000000;
+                    draw_prop_string_bold(short_title, content_start_x + 20, by + 5, btn_text_color);
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // SEPARATORE MATEMATICO CON SIMBOLO DELL'INTEGRALE (Con Limite Anti-Collisione)
+    // ========================================================================
+    // 1. Calcoliamo l'ingombro teorico dei pulsanti delle app da sinistra.
+    int apps_occupied_end = tb_start_x + (valid_count * actual_btn_w_calc);
+    
+    // 2. Calcoliamo la posizione ideale del separatore (a destra delle app con respiro).
+    int sep_cx = apps_occupied_end + 24;
+    int sep_cy = tb_y + 13;
+
+    // 3. CAP DI SICUREZZA (Anti-Sovrapposizione):
+    // Il separatore non deve MAI invadere lo spazio vitale dell'icona Info.
+    // Fissiamo il limite massimo a 15 pixel a sinistra del tasto Info.
+    int max_sep_x = info_x - 15;
+    if (sep_cx > max_sep_x) {
+        sep_cx = max_sep_x;
+    }
+
+    // Coordinate del core bianco dell'integrale
+    static const int int_dx[] = {
+        0,0,0,0,0,0,0,0,0,0,0,
+        0,1,2,3,4,4,3,
+        0,-1,-2,-3,-4,-4,-3
+    };
+    static const int int_dy[] = {
+        -5,-4,-3,-2,-1,0,1,2,3,4,5,
+        -6,-7,-8,-8,-7,-6,-6,
+        6,7,8,8,7,6,6
+    };
+
+    // Passaggio 1: Bordo nero di 2 pixel (ottenuto con quadrati 5x5 sovrapposti)
+    for (int p = 0; p < 25; p++) {
+        draw_rect(sep_cx + int_dx[p] - 2, sep_cy + int_dy[p] - 2, 5, 5, 0xFF000000);
+    }
+
+    // Passaggio 2: Core bianco puro
+    for (int p = 0; p < 25; p++) {
+        draw_pixel(sep_cx + int_dx[p], sep_cy + int_dy[p], 0xFFFFFFFF);
+    }
+
+
+
+
+
+    // =======================================================
+    // DISEGNO NUVOLA INFORMATIVA (Tooltip Stile XP)
+    // =======================================================
+    if (active_tooltip_window != -1 && windows[active_tooltip_window].active) {
+        window_t* twin = &windows[active_tooltip_window];
+        
+        int text_w = get_prop_string_width(twin->full_path);
+        int bub_w = text_w + 20; // 10px di padding interno
+        int bub_h = 24;          
+        
+        int ix = twin->x + 6;
+        int iy = twin->y + 8;
+        
+        // Punta del triangolo (Centro-basso dell'icona)
+        int tip_x = ix + 8;
+        int tip_y = iy - 2;
+        
+        int bx = tip_x - 12; 
+        // ABBASSATA DI 2 PIXEL: Ora il bordo inferiore combacia perfettamente col triangolo!
+        int by = tip_y - 4 - bub_h;
+        
+        uint32_t bub_color = 0xFFE6E1D7;
+        uint32_t border_color = 0xFF000000; // Nero fine
+        
+        // Sistema Anti-Uscita dallo schermo
+        int draw_triangle = 1;
+        if (by < 0) {
+            by = iy + 22; // Nuvola SOTTO l'icona
+            tip_y = by - 5; 
+            draw_triangle = 2; // Triangolo rovesciato
+        }
+        if (bx < 0) bx = 0;
+        if (bx + bub_w > fb_width) bx = fb_width - bub_w;
+        
+        // 1. Corpo principale (Arrotondato 1px)
+        draw_rect(bx + 1, by, bub_w - 2, bub_h, bub_color);
+        draw_rect(bx, by + 1, bub_w, bub_h - 2, bub_color);
+        
+        // 2. Bordi del corpo
+        draw_rect(bx + 1, by, bub_w - 2, 1, border_color); 
+        draw_rect(bx + 1, by + bub_h - 1, bub_w - 2, 1, border_color); 
+        draw_rect(bx, by + 1, 1, bub_h - 2, border_color); 
+        draw_rect(bx + bub_w - 1, by + 1, 1, bub_h - 2, border_color); 
+        
+        // 3. Triangolo di connessione
+        if (draw_triangle == 1) { // Punta in basso
+            for(int ty = 0; ty < 6; ty++) {
+                int tw = 1 + (ty * 2);
+                int tx = tip_x - ty;
+                int current_y = tip_y - ty;
+                draw_rect(tx, current_y, tw, 1, bub_color); 
+                draw_pixel(tx - 1, current_y, border_color); 
+                draw_pixel(tx + tw, current_y, border_color); 
+            }
+            // Cancelliamo esattamente gli 11 pixel di bordo nero sopra al triangolo
+            draw_rect(tip_x - 5, by + bub_h - 1, 11, 1, bub_color); 
+        } else if (draw_triangle == 2) { // Punta in alto
+            for(int ty = 0; ty < 6; ty++) {
+                int tw = 1 + (ty * 2);
+                int tx = tip_x - ty;
+                int current_y = tip_y + ty;
+                draw_rect(tx, current_y, tw, 1, bub_color); 
+                draw_pixel(tx - 1, current_y, border_color); 
+                draw_pixel(tx + tw, current_y, border_color); 
+            }
+            draw_rect(tip_x - 4, by, 9, 1, bub_color);
+        }
+        
+        // 4. Testo del percorso
+        draw_prop_string(twin->full_path, bx + 10, by + 4, border_color);
+    }
+
+    // ========================================================================
+    // --- ANIMAZIONE (Effetto Lampada Magica / Genie Funnel Affinato) ---
+    // ========================================================================
+    if (anim_active && anim_h > 0) {
+        uint32_t bg_color        = 0xFFFFFFFF; // Bianco puro di fondo
+        uint32_t pinstripe_color = 0xFFE8E8E8; // Grigio Pinstripe
+        uint32_t border_color    = 0xFF808080; // Bordo di definizione
+        
+        // 1. Calcolo del progresso temporale dell'animazione (da 0 a 100)
+        int prog = 0;
+        if (anim_frames_total > 0) {
+            prog = ((anim_frames_total - anim_frames_left) * 100) / anim_frames_total;
+        }
+        if (prog > 100) prog = 100;
+
+        // 2. Centri di gravità e larghezze globali
+        int c_start   = anim_start_x + (anim_start_w / 2);
+        int c_target  = anim_target_x + (anim_target_w / 2);
+        int c_current = anim_x + (anim_w / 2);
+
+        // 3. Progresso orizzontale accelerato per la base (si allinea nel primo 50% del tempo)
+        int align_linear = prog * 2;
+        if (align_linear > 100) align_linear = 100;
+        
+        // Applico una curva Ease-Out quadratica all'allineamento per una frenata morbida sul bottone
+        int align_p = (align_linear * (200 - align_linear)) / 100;
+
+        // Target dinamici ed esclusivi per la base della finestra:
+        // A inizio animazione (align_p=0) la base è dritta e larga quanto l'app originale.
+        // Scorrendo verso align_p=100, si sposta e si stringe per incastrarsi sul bottone.
+        int c_bottom_target = c_start + ((c_target - c_start) * align_p) / 100;
+        int w_bottom_target = anim_start_w + ((anim_target_w - anim_start_w) * align_p) / 100;
+
+        // Disegniamo la sagoma a imbuto riga per riga
+        for (int ly = anim_y; ly < anim_y + anim_h; ly++) {
+            int dy = ly - anim_y; // Distanza dalla cima
+            
+            // A. MATEMATICA DELL'IMBUTO (Svasatura a Tromba)
+            int t = (dy * 100) / anim_h;
+            int inv_t = 100 - t;
+            int pull = 100 - ((inv_t * inv_t * inv_t) / 10000); 
+            
+            // B. Interpolazione geometrica della riga mirata ai target dinamici della base
+            int cx = c_current + ((c_bottom_target - c_current) * pull) / 100;
+            int lw = anim_w + ((w_bottom_target - anim_w) * pull) / 100;
+            
+            if (lw < 4) lw = 4; // Sicurezza di rendering
+            int rx = cx - (lw / 2);
+            
+            // C. COLORAZIONE RIGA CON PINSTRIPE
+            if (dy <= 1 || dy >= anim_h - 2) {
+                draw_rect(rx, ly, lw, 1, border_color);
+            } else {
+                draw_rect(rx, ly, 2, 1, border_color);
+                draw_rect(rx + lw - 2, ly, 2, 1, border_color);
+                
+                uint32_t row_color = (dy % 4 >= 2) ? pinstripe_color : bg_color;
+                draw_rect(rx + 2, ly, lw - 4, 1, row_color);
+            }
+        }
+    }
+
+
+    // --- CURSORE DEL MOUSE ---
+    static const uint8_t s90s_cursor[16][12] = {
+        {1,0,0,0,0,0,0,0,0,0,0,0}, 
+        {1,1,0,0,0,0,0,0,0,0,0,0},
+        {1,2,1,0,0,0,0,0,0,0,0,0},
+        {1,2,2,1,0,0,0,0,0,0,0,0},
+        {1,2,2,2,1,0,0,0,0,0,0,0},
+        {1,2,2,2,2,1,0,0,0,0,0,0},
+        {1,2,2,2,2,2,1,0,0,0,0,0},
+        {1,2,2,2,2,2,2,1,0,0,0,0},
+        {1,2,2,2,2,2,2,2,1,0,0,0},
+        {1,2,2,2,2,2,2,2,2,1,0,0},
+        {1,2,2,2,2,2,1,1,1,1,0,0},
+        {1,2,2,1,2,2,1,0,0,0,0,0},
+        {1,2,1,0,1,2,2,1,0,0,0,0},
+        {1,1,0,0,1,2,2,1,0,0,0,0},
+        {1,0,0,0,0,1,2,2,1,0,0,0},
+        {0,0,0,0,0,0,1,1,0,0,0,0}
+    };
+
+    // Il codice ha una predisposizione al riempimento in caso di click (per ora non abilitata)
+    uint32_t fill_color = is_clicking ? 0xFFFFFFFF : 0xFFFFFFFF; 
+
+    for (int cy = 0; cy < 16; cy++) {
+        for (int cx = 0; cx < 12; cx++) {
+            if (s90s_cursor[cy][cx] == 1) {
+                draw_pixel(mouse_x + cx, mouse_y + cy, 0xFF000000); // Bordo Nero
+            } else if (s90s_cursor[cy][cx] == 2) {
+                draw_pixel(mouse_x + cx, mouse_y + cy, fill_color); // Riempimento interno
+            }
+        }
+    }
+    /* VECCHIO MODELLO CURSORE A CROCE (ce lo teniamo commentato per ricordo)
+    uint32_t cursor_color = is_clicking ? 0xFF00FF00 : 0xFFFFFFFF;
+    draw_rect(mouse_x - 1, mouse_y - 8, 3, 16, 0xFF000000); 
+    draw_rect(mouse_x - 8, mouse_y - 1, 16, 3, 0xFF000000); 
+    draw_rect(mouse_x, mouse_y - 7, 1, 14, cursor_color);   
+    draw_rect(mouse_x - 7, mouse_y, 14, 1, cursor_color);   
+    */
+    
+    // --- OVERLAY: BARRA DI PROGRESSO GLOBALE ---
+    if (show_progress_bar && progress_total > 0) {
+        int pb_w = 300; int pb_h = 70;
+        int pb_x = (fb_width - pb_w) / 2; int pb_y = (fb_height - pb_h) / 2;
+        
+        draw_window(pb_x, pb_y, pb_w, pb_h, 1);
+        draw_prop_string_bold("Copia file in corso...", pb_x + 10, pb_y + 8, 0xFFFFFFFF);
+        
+        int fill_w = (progress_current * (pb_w - 20)) / progress_total;
+        if (fill_w > pb_w - 20) fill_w = pb_w - 20; // Cap grafico
+        
+        draw_textfield(pb_x + 10, pb_y + 35, pb_w - 20, 14, 0xFFE1E1E1);
+        if (fill_w > 0) draw_rect(pb_x + 12, pb_y + 37, fill_w - 4, 10, 0xFF05339b);
+        
+        // Calcolo sicuro percentuale (anti-overflow 32bit)
+        int pct = 0;
+        if (progress_total > 100) pct = progress_current / (progress_total / 100);
+        else pct = (progress_current * 100) / progress_total;
+        if (pct > 100) pct = 100;
+
+        char pct_str[32]; itoa(pct, pct_str);
+        int p_idx = 0; while(pct_str[p_idx]) p_idx++;
+        pct_str[p_idx++] = '%'; pct_str[p_idx] = '\0';
+        draw_prop_string_bold(pct_str, pb_x + (pb_w/2) - 10, pb_y + 34, 0xFFFFFFFF);
+    }
+
+    swap_buffers();
+}
+
+
+
+
+// ==========================================
+// MOUSE PS/2
+// ==========================================
+void mouse_wait(uint8_t type) {
+    uint32_t timeout = 100000;
+    if (type == 0) { while (timeout--) { if ((inb(0x64) & 1) == 1) return; } } 
+    else { while (timeout--) { if ((inb(0x64) & 2) == 0) return; } }
+}
+
+void mouse_init() {
+    mouse_wait(1); outb(0x64, 0xA8); 
+    mouse_wait(1); outb(0x64, 0x20); 
+    mouse_wait(0); uint8_t status = (inb(0x60) | 2); 
+    mouse_wait(1); outb(0x64, 0x60); mouse_wait(1); outb(0x60, status);
+    mouse_wait(1); outb(0x64, 0xD4); mouse_wait(1); outb(0x60, 0xF4); 
+    mouse_wait(0); (void)inb(0x60); 
+}
+
+// ==========================================
+// DRIVER DISCO FISSO (ATA PIO MODE Sicuro)
+// ==========================================
+// Ritorna 1 se pronto, 0 se errore o nessun disco
+int ata_wait_ready() {
+    int timeout = 100000;
+    while (--timeout) {
+        uint8_t status = inb(0x1F7);
+        // Se la porta risponde 0xFF significa che non c'è nessun disco attaccato
+        if (status == 0xFF) return 0; 
+        // BSY=0 e RDY=1: Il disco è pronto per parlare
+        if ((status & 0xC0) == 0x40) return 1; 
+    }
+    return 0; // Timeout: il disco si è bloccato
+}
+
+
+// Interroga l'Hardware per scoprire Modello e Capienza del disco
+int ata_identify() {
+    // 1. Selezioniamo il disco primario (Master)
+    outb(0x1F6, 0xA0); 
+    
+    // 2. Azzeriamo i parametri come richiesto dallo standard ATA
+    outb(0x1F2, 0); outb(0x1F3, 0); outb(0x1F4, 0); outb(0x1F5, 0);
+    
+    // 3. Inviamo il comando IDENTIFY (0xEC)
+    outb(0x1F7, 0xEC);
+
+    // Leggiamo lo stato. Se è 0, non c'è nessun disco collegato
+    uint8_t status = inb(0x1F7);
+    if (status == 0) return 0; 
+
+    // 4. Aspettiamo che il disco smetta di essere occupato (BSY)
+    while ((inb(0x1F7) & 0x80) != 0);
+
+    // 5. Verifichiamo se ha risposto DRQ (Data Request) o ERR (Error)
+    while (1) {
+        status = inb(0x1F7);
+        if (status & 0x01) return 0; // Errore! Forse non è un disco ATA
+        if (status & 0x08) break;    // Dati pronti per essere letti!
+    }
+
+    // 6. Leggiamo i 256 pacchetti da 16-bit (512 byte in totale)
+    uint16_t identify_data[256] = {0}; 
+    for (int i = 0; i < 256; i++) {
+        identify_data[i] = inw(0x1F0);
+    }
+
+    // 7. ESTRAZIONE DATI: Settori Totali (Supporto LBA48 fino a 2 Terabyte)
+    // Controlliamo se il disco supporta LBA48 leggendo il bit 10 della parola 83
+    if (identify_data[83] & (1 << 10)) {
+        // LBA48: Leggiamo le parole 100 e 101
+        ata_drive_capacity_sectors = ((uint32_t)identify_data[101] << 16) | (uint32_t)identify_data[100];
+    } else {
+        // Fallback per dischi antichi: Vecchio LBA28
+        ata_drive_capacity_sectors = ((uint32_t)identify_data[61] << 16) | (uint32_t)identify_data[60];
+    }
+    
+    // (Settori / 2048) evita l'overflow a 32-bit dei dischi enormi
+    ata_drive_capacity_mb = ata_drive_capacity_sectors / 2048;
+
+    // 8. ESTRAZIONE DATI: Modello del disco (Dalla parola 27 alla 46)
+    // Lo standard ATA salva le lettere invertite a coppie! Dobbiamo swapparle.
+    int k = 0;
+    for (int i = 27; i <= 46; i++) {
+        ata_drive_model[k++] = (char)(identify_data[i] >> 8);   // Lettera a Sinistra
+        ata_drive_model[k++] = (char)(identify_data[i] & 0xFF); // Lettera a Destra
+    }
+    ata_drive_model[40] = '\0';
+
+    // Puliamo gli spazi vuoti alla fine del nome
+    for (int i = 39; i >= 0; i--) {
+        if (ata_drive_model[i] == ' ') ata_drive_model[i] = '\0';
+        else break;
+    }
+
+    return 1;
+}
+
+// Ritorna 1 se ha letto con successo, 0 altrimenti
+int ata_read_sector(uint32_t lba, uint8_t* buffer) {
+    // Se superiamo i 137 GB (0x0FFFFFFF), accendiamo la trazione integrale LBA48
+    int use_lba48 = (lba >= 0x0FFFFFFF);
+
+    // 1. Selezioniamo il disco
+    if (use_lba48) {
+        outb(0x1F6, 0x40); // LBA48 non usa i bit alti del LBA in questa porta
+    } else {
+        outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F)); 
+    }
+    
+    inb(0x1F7); inb(0x1F7); inb(0x1F7); inb(0x1F7); // Ritardo
+    if (!ata_wait_ready()) return 0;
+    
+    // 2. Invio dei byte alti (Solo per LBA48)
+    if (use_lba48) {
+        outb(0x1F2, 0); // Settori alti (0 perché leggiamo 1 solo settore)
+        outb(0x1F3, (uint8_t)(lba >> 24)); // LBA4
+        outb(0x1F4, 0); // LBA5 (Zero finché stiamo sotto i 2TB)
+        outb(0x1F5, 0); // LBA6
+    }
+    
+    // 3. Settiamo i parametri base (Per entrambi)
+    outb(0x1F2, 1); // Settori bassi (Vogliamo leggere 1 settore)
+    outb(0x1F3, (uint8_t)lba);
+    outb(0x1F4, (uint8_t)(lba >> 8));
+    outb(0x1F5, (uint8_t)(lba >> 16));
+    
+    // 4. Invia comando READ (Standard o Extended)
+    if (use_lba48) outb(0x1F7, 0x24); // READ SECTORS EXT
+    else outb(0x1F7, 0x20);           // READ SECTORS
+    
+    // 5. Aspettiamo che ci dica DRQ (Data Request)
+    int timeout = 100000;
+
+    while (--timeout) {
+        uint8_t status = inb(0x1F7);
+        if (status & 0x08) break; // Dati pronti
+        if (status & 0x01) return 0; // Errore hardware
+    }
+    if (timeout == 0) return 0;
+
+    // 6. Leggi i dati
+    uint16_t* ptr = (uint16_t*)buffer;
+    for (int i = 0; i < 256; i++) {
+        ptr[i] = inw(0x1F0);
+    }
+
+    if (show_progress_bar && progress_total > 0) {
+        progress_current += 512;
+        if (progress_current > progress_total) progress_current = progress_total;
+        
+        // Aggiorna la grafica solo ogni 64 KB (65536 byte) trasferiti
+        if (progress_current % 65536 == 0) render_desktop(mouse_x, mouse_y, is_clicking);
+    }
+
+    return 1; // Successo
+}
+
+// Ritorna 1 se ha scritto con successo, 0 altrimenti
+int ata_write_sector(uint32_t lba, uint8_t* buffer) {
+    int use_lba48 = (lba >= 0x0FFFFFFF);
+
+    if (use_lba48) outb(0x1F6, 0x40); 
+    else outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F)); 
+    
+    inb(0x1F7); inb(0x1F7); inb(0x1F7); inb(0x1F7); 
+    if (!ata_wait_ready()) return 0;
+
+    if (use_lba48) {
+        outb(0x1F2, 0); 
+        outb(0x1F3, (uint8_t)(lba >> 24)); 
+        outb(0x1F4, 0); outb(0x1F5, 0);
+    }
+    
+    outb(0x1F2, 1);
+    outb(0x1F3, (uint8_t)lba);
+    outb(0x1F4, (uint8_t)(lba >> 8));
+    outb(0x1F5, (uint8_t)(lba >> 16));
+    
+    // Comando "WRITE SECTORS" (0x30) o "EXT" (0x34)
+    if (use_lba48) outb(0x1F7, 0x34);
+    else outb(0x1F7, 0x30);
+    
+    // Aspettiamo che ci chieda i dati (DRQ bit = 1)
+    int timeout = 100000;
+
+    while (--timeout) {
+        uint8_t status = inb(0x1F7);
+        if (status & 0x08) break; 
+        if (status & 0x01) return 0; 
+    }
+    if (timeout == 0) return 0;
+
+    // SCRIVIAMO I DATI (256 istruzioni da 16-bit = 512 byte)
+    uint16_t* ptr = (uint16_t*)buffer;
+    for (int i = 0; i < 256; i++) {
+        outw(0x1F0, ptr[i]);
+    }
+
+    // Svuotiamo la cache del disco per sicurezza (Cache Flush = 0xE7)
+    outb(0x1F7, 0xE7);
+    ata_wait_ready();
+
+    if (show_progress_bar && progress_total > 0) {
+        progress_current += 512;
+        if (progress_current > progress_total) progress_current = progress_total;
+        
+        if (progress_current % 65536 == 0) render_desktop(mouse_x, mouse_y, is_clicking);
+    }
+    return 1;
+}
+
+
+// ==========================================
+// MOUNTING DEL FILE SYSTEM
+// ==========================================
+// Legge il Superblocco e calcola la divisione in "Quartieri" (Block Groups)
+int ext2_mount() {
+    uint8_t sector_buffer[512] = {0};
+    
+    // Il Superblocco inizia SEMPRE al byte 1024 del disco (LBA 2)
+    if (!ata_read_sector(2, sector_buffer)) return 0;
+    
+    ext2_superblock_t sb;
+    uint8_t* dst = (uint8_t*)&sb;
+    for(size_t i = 0; i < sizeof(ext2_superblock_t); i++) dst[i] = sector_buffer[i];
+    
+    if (sb.s_magic != 0xEF53) return 0; // Se non ha la firma magica, non è Ext2
+    
+    ext2_blocks_per_group = sb.s_blocks_per_group;
+    ext2_inodes_per_group = sb.s_inodes_per_group;
+    
+    // Calcoliamo quanti "Quartieri" ci sono arrotondando per eccesso
+    ext2_total_groups = (sb.s_blocks_count + ext2_blocks_per_group - 1) / ext2_blocks_per_group;
+    
+    // Per blocchi da 1024 byte, la Tabella dei Quartieri (BGDT) inizia nel Blocco 2 (LBA 4)
+    ext2_bgdt_lba = 4; 
+    
+    return 1;
+}
+
+
+// ==========================================
+// MOTORE DI SCRITTURA EXT2
+// ==========================================
+
+// Trova e prenota un Blocco Dati libero viaggiando su tutto il disco
+uint32_t ext2_allocate_block() {
+    uint8_t sector_buffer[512] = {0};
+    uint8_t bitmap_buffer[512] = {0};
+
+    // Cicliamo su TUTTI i Block Groups
+    for (uint32_t bg = 0; bg < ext2_total_groups; bg++) {
+        
+        // 1. Troviamo il descrittore di QUESTO specifico gruppo nella BGDT
+        // Ogni descrittore pesa 32 byte (in un settore da 512 ce ne stanno 16)
+        uint32_t bgdt_sector = ext2_bgdt_lba + ((bg * 32) / 512);
+        uint32_t bgdt_offset = (bg * 32) % 512;
+        
+        if (!ata_read_sector(bgdt_sector, sector_buffer)) continue;
+        
+        ext2_bg_desc_t bgd;
+        uint8_t* dst = (uint8_t*)&bgd;
+        for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[bgdt_offset + i];
+
+        // 2. Troviamo la mappa dei blocchi di questo gruppo
+        uint32_t bitmap_lba = bgd.bg_block_bitmap * 2;
+
+        // Un gruppo ha migliaia di blocchi, la sua bitmap occupa più di un settore!
+        uint32_t bitmap_sectors = (ext2_blocks_per_group + 4095) / 4096; 
+        
+        // Scansioniamo tutti i settori della bitmap di questo gruppo
+        for (uint32_t s = 0; s < bitmap_sectors; s++) {
+            if (!ata_read_sector(bitmap_lba + s, bitmap_buffer)) continue;
+
+            for (uint32_t byte_idx = 0; byte_idx < 512; byte_idx++) {
+                if (bitmap_buffer[byte_idx] != 0xFF) { // C'è spazio
+                    for (int bit = 0; bit < 8; bit++) {
+                        if (!(bitmap_buffer[byte_idx] & (1 << bit))) {
+                            
+                            // TROVATO Lo marchiamo occupato e salviamo
+                            bitmap_buffer[byte_idx] |= (1 << bit);
+                            ata_write_sector(bitmap_lba + s, bitmap_buffer);
+
+                            // Calcoliamo il numero finale del blocco
+                            // Blocco = (N. Gruppo * Blocchi per Gruppo) + (Offset nella mappa) + 1
+                            uint32_t block_num = (bg * ext2_blocks_per_group) + (s * 4096) + (byte_idx * 8) + bit + 1;
+                            return block_num;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0; // L'intero disco è completamente pieno
+}
+
+// Trova e prenota un Inode libero viaggiando su tutto il disco
+uint32_t ext2_allocate_inode() {
+    uint8_t sector_buffer[512] = {0};
+    uint8_t bitmap_buffer[512] = {0};
+
+    for (uint32_t bg = 0; bg < ext2_total_groups; bg++) {
+        uint32_t bgdt_sector = ext2_bgdt_lba + ((bg * 32) / 512);
+        uint32_t bgdt_offset = (bg * 32) % 512;
+        
+        if (!ata_read_sector(bgdt_sector, sector_buffer)) continue;
+        
+        ext2_bg_desc_t bgd;
+        uint8_t* dst = (uint8_t*)&bgd;
+        for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[bgdt_offset + i];
+
+        uint32_t bitmap_lba = bgd.bg_inode_bitmap * 2;
+        uint32_t bitmap_sectors = (ext2_inodes_per_group + 4095) / 4096; 
+        
+        for (uint32_t s = 0; s < bitmap_sectors; s++) {
+            if (!ata_read_sector(bitmap_lba + s, bitmap_buffer)) continue;
+
+            for (uint32_t byte_idx = 0; byte_idx < 512; byte_idx++) {
+                if (bitmap_buffer[byte_idx] != 0xFF) { 
+                    for (int bit = 0; bit < 8; bit++) {
+                        if (!(bitmap_buffer[byte_idx] & (1 << bit))) {
+                            
+                            bitmap_buffer[byte_idx] |= (1 << bit);
+                            ata_write_sector(bitmap_lba + s, bitmap_buffer);
+
+                            uint32_t inode_num = (bg * ext2_inodes_per_group) + (s * 4096) + (byte_idx * 8) + bit + 1;
+                            return inode_num;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0; 
+}
+
+// ==============================================================================
+// VFS CORE: TRADUTTORE DI BLOCCHI E GESTIONE INODE
+// ==============================================================================
+
+// Helper: Estrae la struttura Inode completa direttamente dal disco
+ext2_inode_t ext2_get_inode_struct(uint32_t inode_num) {
+    ext2_inode_t inode; uint8_t* out = (uint8_t*)&inode;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) out[i] = 0;
+    if (inode_num == 0) return inode;
+
+    uint8_t sector_buffer[512];
+    ata_read_sector(4, sector_buffer);
+    ext2_bg_desc_t bgd; uint8_t* dst = (uint8_t*)&bgd;
+    for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[i];
+    
+    uint32_t inode_table_lba = bgd.bg_inode_table * 2;
+    uint32_t inode_size = 128;
+    
+    ata_read_sector(inode_table_lba, sector_buffer);
+    ext2_inode_t root_test; dst = (uint8_t*)&root_test;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[128 + i];
+    if ((root_test.i_mode & 0xF000) != 0x4000) inode_size = 256;
+
+    uint32_t index = inode_num - 1;
+    ata_read_sector(inode_table_lba + ((index * inode_size) / 512), sector_buffer);
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) out[i] = sector_buffer[((index * inode_size) % 512) + i];
+
+    return inode;
+}
+
+// IL MOTORE VFS: Traduce un blocco logico (es. il 15° Kilobyte del file) nel vero Blocco Fisico Ext2 
+uint32_t ext2_get_phys_block(ext2_inode_t* inode, uint32_t logical_block) {
+    // 1. Blocchi Diretti
+    if (logical_block < 12) return inode->i_block[logical_block];
+    
+    // 2. Singolo Indiretto
+    if (logical_block < 268) {
+        uint8_t sec[1024];
+        ata_read_sector(inode->i_block[12] * 2, sec);
+        ata_read_sector(inode->i_block[12] * 2 + 1, sec + 512);
+        return ((uint32_t*)sec)[logical_block - 12];
+    }
+    
+    // 3. Doppio Indiretto
+    if (logical_block < 65804) {
+        uint32_t d_idx = logical_block - 268;
+        uint8_t sec[1024];
+        ata_read_sector(inode->i_block[13] * 2, sec);
+        ata_read_sector(inode->i_block[13] * 2 + 1, sec + 512);
+        uint32_t sub_block = ((uint32_t*)sec)[d_idx / 256]; // Troviamo la sub-rubrica
+        
+        ata_read_sector(sub_block * 2, sec);
+        ata_read_sector(sub_block * 2 + 1, sec + 512);
+        return ((uint32_t*)sec)[d_idx % 256]; // Estraiamo il blocco finale
+    }
+    return 0;
+}
+
+// ==============================================================================
+// IL PATH PARSER: Naviga l'albero delle directory e trova l'Inode di destinazione
+// ==============================================================================
+uint32_t ext2_resolve_path(const char* path) {
+    // 1. Controllo di base: accettiamo solo percorsi assoluti che partono dalla Root
+    if (path[0] != '/') return 0; 
+
+    uint8_t sector_buffer[512] = {0};
+
+    // 2. Leggiamo la BGDT per sapere dove si trova la Tabella degli Inode
+    if (!ata_read_sector(4, sector_buffer)) return 0;
+    ext2_bg_desc_t bgd; uint8_t* dst = (uint8_t*)&bgd;
+    for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[i];
+    uint32_t inode_table_lba = bgd.bg_inode_table * 2;
+
+    // Scopriamo la grandezza degli Inode formattati (128 o 256 byte)
+    uint32_t inode_size = 128;
+    ata_read_sector(inode_table_lba, sector_buffer);
+    ext2_inode_t root_test; dst = (uint8_t*)&root_test;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[128 + i];
+    if ((root_test.i_mode & 0xF000) != 0x4000) inode_size = 256;
+
+    // 3. INIZIO DEL VIAGGIO: Partiamo sempre dalla Root (Inode 2)
+    uint32_t current_inode_num = 2; 
+    int p_idx = 1; // Iniziamo a leggere la stringa dal carattere 1 (saltiamo il primo '/')
+
+    while (path[p_idx] != '\0') {
+        // A. Estraiamo la prossima cartella/file dal percorso (fino al prossimo slash)
+        char target_name[256];
+        int t_len = 0;
+        while (path[p_idx] != '/' && path[p_idx] != '\0' && t_len < 255) {
+            target_name[t_len++] = path[p_idx++];
+        }
+        target_name[t_len] = '\0';
+
+        // (Sicurezza: Se troviamo due slash di fila come "//", li ignoriamo)
+        if (t_len == 0) {
+            if (path[p_idx] == '/') p_idx++;
+            continue;
+        }
+
+        // B. Apriamo in RAM l'Inode Corrente
+        uint32_t index = current_inode_num - 1;
+        uint32_t sect_off = (index * inode_size) / 512;
+        uint32_t in_sect_off = (index * inode_size) % 512;
+
+        if (!ata_read_sector(inode_table_lba + sect_off, sector_buffer)) return 0;
+        
+        ext2_inode_t current_inode; dst = (uint8_t*)&current_inode;
+        for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[in_sect_off + i];
+
+        // C. L'Inode in cui siamo entrati è davvero una cartella (0x4000)?
+        if ((current_inode.i_mode & 0xF000) != 0x4000) return 0; 
+
+
+
+
+        // D. Apriamo il blocco dati della cartella e cerchiamo "target_name"
+        uint32_t dir_block_lba = current_inode.i_block[0] * 2;
+        uint8_t dir_buffer[1024]; // Nuovo buffer capiente
+        if (!ata_read_sector(dir_block_lba, dir_buffer)) return 0;
+        if (!ata_read_sector(dir_block_lba + 1, dir_buffer + 512)) return 0;
+
+        uint32_t offset = 0;
+        uint32_t next_inode_num = 0;
+
+        while (offset < 1024) { // Scansioniamo tutti i 1024 byte
+            ext2_dir_entry_t entry; uint8_t* edst = (uint8_t*)&entry;
+            for(size_t i = 0; i < sizeof(ext2_dir_entry_t); i++) {edst[i] = dir_buffer[offset + i];}
+            
+            if (entry.inode == 0 || entry.rec_len == 0) break;
+
+            char fname[256];
+            for (int k = 0; k < entry.name_len; k++) {fname[k] = dir_buffer[offset + 8 + k];}
+            
+            fname[entry.name_len] = '\0';
+
+            // Confrontiamo i nomi
+            int match = 1;
+            for(int k = 0; k <= entry.name_len; k++) {
+                if (fname[k] != target_name[k]) { match = 0; break; }
+            }
+
+            // Memorizziamo l'Inode del prossimo passo e rompiamo il ciclo
+            if (match) {
+                next_inode_num = entry.inode;
+                break; 
+            }
+            offset += entry.rec_len; // Saltiamo al prossimo file nella cartella
+        }
+
+        // E. Il file/cartella non esiste
+        if (next_inode_num == 0) return 0; 
+
+        // F. Preparazione per il prossimo giro: saltiamo dentro la nuova cartella
+        current_inode_num = next_inode_num;
+        if (path[p_idx] == '/') p_idx++; // Saltiamo lo slash separatore
+    }
+
+    // 4. ARRIVO: Se siamo usciti dal ciclo sani e salvi, abbiamo in mano la destinazione!
+    return current_inode_num;
+}
+
+
+
+// Controlla se un file o cartella esiste già nella Root (Ritorna 1 se esiste, 0 se libero)
+int ext2_exists(const char* target_name) {
+    uint8_t sector_buffer[512] = {0};
+    if (!ata_read_sector(4, sector_buffer)) return 0;
+    
+    ext2_bg_desc_t bgd; uint8_t* dst = (uint8_t*)&bgd;
+    for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[i];
+
+    uint32_t inode_table_lba = bgd.bg_inode_table * 2;
+    if (!ata_read_sector(inode_table_lba, sector_buffer)) return 0;
+
+    ext2_inode_t root_inode; dst = (uint8_t*)&root_inode;
+    
+    // Proviamo a leggere l'Inode 2 assumendo che la grandezza sia 128 byte
+    for(size_t i=0; i<128; i++) dst[i] = sector_buffer[128 + i];
+    
+    // Se non è una cartella (0x4000), significa che mke2fs ha formattato a 256 byte
+    if ((root_inode.i_mode & 0xF000) != 0x4000) {
+        for(size_t i=0; i<256; i++) dst[i] = sector_buffer[256 + i];
+    }
+
+    if ((root_inode.i_mode & 0xF000) == 0x4000) {
+        uint8_t dir_buffer[1024]; 
+        if (ata_read_sector(root_inode.i_block[0] * 2, dir_buffer) && 
+            ata_read_sector((root_inode.i_block[0] * 2) + 1, dir_buffer + 512)) {
+            
+            uint32_t offset = 0;
+            while (offset < 1024) { // Scansioniamo tutto
+                ext2_dir_entry_t entry; uint8_t* edst = (uint8_t*)&entry;
+                for(size_t i = 0; i < sizeof(ext2_dir_entry_t); i++) {edst[i] = dir_buffer[offset + i];}
+                if (entry.inode == 0 || entry.rec_len == 0) break;
+
+                char fname[256];
+                for (int k = 0; k < entry.name_len; k++) {fname[k] = dir_buffer[offset + 8 + k];}
+                
+                
+                fname[entry.name_len] = '\0';
+
+                int match = 1;
+                for(int k = 0; k <= entry.name_len; k++) {
+                    if (fname[k] != target_name[k]) { match = 0; break; }
+                }
+                if (match) return 1; // IL NOME è GIà PRESO
+
+                offset += entry.rec_len;
+            }
+        }
+    }
+    return 0; // Il nome è libero
+}
+
+
+// Scrive un nuovo file di testo nel percorso specificato
+int ext2_write_file(const char* full_path, const char* data, uint32_t file_size) {
+    // 1. SPLIT DEL PERCORSO: Separare cartella madre e nome file
+    char parent_path[256];
+    char filename[256];
+    int last_slash = -1;
+    int len = 0;
+    
+    while(full_path[len] != '\0' && len < 255) {
+        if (full_path[len] == '/') last_slash = len;
+        len++;
+    }
+    if (last_slash == -1 || len == 1) return 0; // Percorso non valido
+    
+    // Estraiamo la cartella madre
+    if (last_slash == 0) { 
+        parent_path[0] = '/'; parent_path[1] = '\0';
+    } else {
+        for(int i=0; i<last_slash; i++) parent_path[i] = full_path[i];
+        parent_path[last_slash] = '\0';
+    }
+    
+    // Estraiamo il nome del file
+    int f_idx = 0;
+    for(int i=last_slash+1; i<len; i++) filename[f_idx++] = full_path[i];
+    filename[f_idx] = '\0';
+    if (f_idx == 0) return 0; // Nessun nome file
+
+    // 2. RISOLUZIONE DELLA CARTELLA MADRE
+    uint32_t parent_inode_num = ext2_resolve_path(parent_path);
+    if (parent_inode_num == 0) return -2; // Errore: Cartella madre inesistente
+
+    uint8_t sector_buffer[512] = {0};
+    uint8_t dir_buffer[1024] = {0};
+
+    // Lettura BGDT
+    if (!ata_read_sector(4, sector_buffer)) return 0;
+    ext2_bg_desc_t bgd; uint8_t* dst = (uint8_t*)&bgd;
+    for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[i];
+    uint32_t inode_table_lba = bgd.bg_inode_table * 2;
+    
+    uint32_t inode_size = 128;
+    ata_read_sector(inode_table_lba, sector_buffer);
+    ext2_inode_t root_test; dst = (uint8_t*)&root_test;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[128 + i];
+    if ((root_test.i_mode & 0xF000) != 0x4000) inode_size = 256;
+
+    // 3. LEGGIAMO LA CARTELLA MADRE E CERCHIAMO DUPLICATI
+    uint32_t p_index = parent_inode_num - 1;
+    uint32_t p_sect_off = (p_index * inode_size) / 512;
+    uint32_t p_in_sect_off = (p_index * inode_size) % 512;
+
+    ata_read_sector(inode_table_lba + p_sect_off, sector_buffer);
+    ext2_inode_t parent_inode;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) ((uint8_t*)&parent_inode)[i] = sector_buffer[p_in_sect_off + i];
+    
+    if ((parent_inode.i_mode & 0xF000) != 0x4000) return -2; // Non è una cartella
+
+    uint32_t dir_block_lba = parent_inode.i_block[0] * 2;
+    ata_read_sector(dir_block_lba, dir_buffer);
+    ata_read_sector(dir_block_lba + 1, dir_buffer + 512);
+
+    uint32_t offset = 0;
+    uint32_t insert_offset = 0;
+    uint32_t real_len_to_shrink = 0;
+
+    while (offset < 1024) {
+        ext2_dir_entry_t entry;
+        for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&entry)[i] = dir_buffer[offset + i];
+        if (entry.inode == 0 || entry.rec_len == 0) break;
+
+        char fname[256];
+        for(int k=0; k<entry.name_len; k++) fname[k] = dir_buffer[offset + 8 + k];
+        fname[entry.name_len] = '\0';
+
+        // Controllo Duplicato in questa cartella
+        int match = 1;
+        if (entry.name_len != f_idx) match = 0;
+        else {
+            for(int k=0; k<f_idx; k++) { if (fname[k] != filename[k]) { match = 0; break; } }
+        }
+        if (match) return -1; // DUPLICATO
+
+        uint32_t real_len = 8 + entry.name_len;
+        if (real_len % 4 != 0) real_len += 4 - (real_len % 4);
+
+        if (entry.rec_len > real_len + 16) {
+            insert_offset = offset;
+            real_len_to_shrink = real_len;
+        }
+        offset += entry.rec_len;
+    }
+
+    if (insert_offset == 0 && offset > 0) return 0; // Spazio esaurito
+
+
+    // 4. CREAZIONE FISICA E ALLOCAZIONE (Sblocco DOPPIO INDIRETTO: ~64 MB)
+    if (file_size == 0) file_size = 1; 
+    
+    uint32_t MAX_EXT2_SIZE = 67383296;
+    if (file_size > MAX_EXT2_SIZE) file_size = MAX_EXT2_SIZE;
+
+    uint32_t num_blocks = (file_size + 1023) / 1024;
+    uint32_t direct_count = (num_blocks > 12) ? 12 : num_blocks;
+    uint32_t single_count = (num_blocks > 12) ? ((num_blocks - 12 > 256) ? 256 : num_blocks - 12) : 0;
+    uint32_t double_count = (num_blocks > 268) ? (num_blocks - 268) : 0;
+
+    uint32_t direct_blocks[12] = {0};
+    uint32_t single_indirect_list_block = 0;
+    uint32_t double_indirect_list_block = 0;
+
+    // PREVENZIONE STACK OVERFLOW: Allochiamo i grandi buffer nell'Heap
+    uint8_t* io_buf = (uint8_t*)kmalloc(1024);
+    uint32_t* single_pointers = (uint32_t*)kmalloc(1024);
+    uint32_t* double_master_pointers = (uint32_t*)kmalloc(1024);
+    uint32_t* sub_pointers = (uint32_t*)kmalloc(1024);
+
+    if (!io_buf || !single_pointers || !double_master_pointers || !sub_pointers) {
+        if(io_buf) {kfree(io_buf);}
+        if(single_pointers) {kfree(single_pointers);}
+        if(double_master_pointers) {kfree(double_master_pointers);}
+        if(sub_pointers) {kfree(sub_pointers);}
+        return 0; // RAM esaurita
+    }
+    for(int i=0; i<256; i++) { single_pointers[i]=0; double_master_pointers[i]=0; sub_pointers[i]=0; }
+
+    // A. ALLOCAZIONE BLOCCHI DIRETTI
+    for (uint32_t b = 0; b < direct_count; b++) {
+        direct_blocks[b] = ext2_allocate_block();
+        if (direct_blocks[b] == 0) break; // Disco Pieno
+        uint32_t offset = b * 1024;
+        for(int i = 0; i < 1024; i++) {io_buf[i] = (data && offset + i < file_size) ? data[offset + i] : 0;}
+        ata_write_sector(direct_blocks[b] * 2, io_buf);
+        ata_write_sector((direct_blocks[b] * 2) + 1, io_buf + 512);
+    }
+
+    // B. ALLOCAZIONE SINGOLO INDIRETTO
+    if (single_count > 0) {
+        single_indirect_list_block = ext2_allocate_block();
+        for (uint32_t b = 0; b < single_count; b++) {
+            single_pointers[b] = ext2_allocate_block();
+            uint32_t offset = (12 + b) * 1024;
+            for(int i = 0; i < 1024; i++) {io_buf[i] = (data && offset + i < file_size) ? data[offset + i] : 0;}
+            ata_write_sector(single_pointers[b] * 2, io_buf);
+            ata_write_sector((single_pointers[b] * 2) + 1, io_buf + 512);
+        }
+        ata_write_sector(single_indirect_list_block * 2, (uint8_t*)single_pointers);
+        ata_write_sector((single_indirect_list_block * 2) + 1, ((uint8_t*)single_pointers) + 512);
+    }
+
+    // C. ALLOCAZIONE DOPPIO INDIRETTO
+    if (double_count > 0) {
+        double_indirect_list_block = ext2_allocate_block();
+        uint32_t blocks_written = 0;
+        uint32_t master_idx = 0;
+
+        while (blocks_written < double_count && master_idx < 256) {
+            double_master_pointers[master_idx] = ext2_allocate_block();
+            for(int i=0; i<256; i++) sub_pointers[i] = 0; 
+            
+            uint32_t sub_idx = 0;
+            while (sub_idx < 256 && blocks_written < double_count) {
+                sub_pointers[sub_idx] = ext2_allocate_block();
+                uint32_t offset = (268 + blocks_written) * 1024;
+                for(int i = 0; i < 1024; i++) {io_buf[i] = (data && offset + i < file_size) ? data[offset + i] : 0;}
+                ata_write_sector(sub_pointers[sub_idx] * 2, io_buf);
+                ata_write_sector((sub_pointers[sub_idx] * 2) + 1, io_buf + 512);
+                
+                sub_idx++;
+                blocks_written++;
+            }
+            ata_write_sector(double_master_pointers[master_idx] * 2, (uint8_t*)sub_pointers);
+            ata_write_sector((double_master_pointers[master_idx] * 2) + 1, ((uint8_t*)sub_pointers) + 512);
+            master_idx++;
+        }
+        ata_write_sector(double_indirect_list_block * 2, (uint8_t*)double_master_pointers);
+        ata_write_sector((double_indirect_list_block * 2) + 1, ((uint8_t*)double_master_pointers) + 512);
+    }
+
+    // PULIZIA RAM KERNEL
+    kfree(io_buf); kfree(single_pointers); kfree(double_master_pointers); kfree(sub_pointers);
+
+
+
+    uint32_t new_inode = ext2_allocate_inode();
+    if (new_inode == 0) return 0;
+
+    // 5. CARTA D'IDENTITà (INODE) DEL NUOVO FILE MULTI-BLOCCO
+    uint32_t n_index = new_inode - 1;
+    uint32_t n_sect_off = (n_index * inode_size) / 512;
+    uint32_t n_in_sect_off = (n_index * inode_size) % 512;
+
+    ata_read_sector(inode_table_lba + n_sect_off, sector_buffer);
+    
+    ext2_inode_t new_file_inode;
+    for(size_t i = 0; i < sizeof(ext2_inode_t); i++) ((uint8_t*)&new_file_inode)[i] = 0;
+    new_file_inode.i_mode = 0x81A4; 
+    new_file_inode.i_size = file_size;   
+    new_file_inode.i_links_count = 1; 
+    
+    // Calcoliamo l'ingombro reale in settori sul disco (inclusi i blocchi rubrica)
+    uint32_t meta_blocks = 0;
+    if (single_count > 0) meta_blocks += 1;
+    if (double_count > 0) {
+        meta_blocks += 1; // La Master-Rubrica
+        meta_blocks += ((double_count + 255) / 256); // Le Sub-Rubriche
+    }
+    
+    new_file_inode.i_blocks = (num_blocks * 2) + (meta_blocks * 2); 
+    
+    // Agganciamo i blocchi all'Inode
+    for(uint32_t b = 0; b < direct_count; b++) new_file_inode.i_block[b] = direct_blocks[b];
+    if (single_count > 0) new_file_inode.i_block[12] = single_indirect_list_block;
+    if (double_count > 0) new_file_inode.i_block[13] = double_indirect_list_block;
+
+
+
+
+
+    for(size_t i = 0; i < sizeof(ext2_inode_t); i++) sector_buffer[n_in_sect_off + i] = ((uint8_t*)&new_file_inode)[i];
+    ata_write_sector(inode_table_lba + n_sect_off, sector_buffer);
+
+    // 6. AGGIUNTA ALLA CARTELLA MADRE
+    ext2_dir_entry_t prev_entry;
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&prev_entry)[i] = dir_buffer[insert_offset + i];
+    
+    uint16_t old_rec_len = prev_entry.rec_len;
+    prev_entry.rec_len = real_len_to_shrink;
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) dir_buffer[insert_offset + i] = ((uint8_t*)&prev_entry)[i];
+    
+    insert_offset += real_len_to_shrink;
+    
+    ext2_dir_entry_t new_entry;
+    new_entry.inode = new_inode;
+    new_entry.rec_len = old_rec_len - real_len_to_shrink;
+    new_entry.name_len = f_idx;
+    new_entry.file_type = 1; // 1 = FILE
+    
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) dir_buffer[insert_offset + i] = ((uint8_t*)&new_entry)[i];
+    for(int i=0; i<f_idx; i++) dir_buffer[insert_offset + 8 + i] = filename[i]; 
+    
+    ata_write_sector(dir_block_lba, dir_buffer);
+
+    return 1; 
+}
+
+
+
+// Crea una nuova Directory seguendo il percorso! (Es: "/system/apps_data")
+int ext2_make_directory(const char* full_path) {
+    // 1. SPLIT DEL PERCORSO: Separare cartella madre e nuovo nome
+    char parent_path[256];
+    char new_dirname[256];
+    int last_slash = -1;
+    int len = 0;
+    
+    while(full_path[len] != '\0' && len < 255) {
+        if (full_path[len] == '/') last_slash = len;
+        len++;
+    }
+    if (last_slash == -1 || len == 1) return 0; // Errore: percorso non valido o solo '/'
+    
+    // Estraiamo la cartella madre
+    if (last_slash == 0) { // Es: "/apps" -> Madre = "/"
+        parent_path[0] = '/'; parent_path[1] = '\0';
+    } else {
+        for(int i=0; i<last_slash; i++) parent_path[i] = full_path[i];
+        parent_path[last_slash] = '\0';
+    }
+    
+    // Estraiamo il nuovo nome
+    int d_idx = 0;
+    for(int i=last_slash+1; i<len; i++) new_dirname[d_idx++] = full_path[i];
+    new_dirname[d_idx] = '\0';
+    if (d_idx == 0) return 0; // Nessun nome fornito
+
+    // 2. RISOLUZIONE DELLA CARTELLA MADRE
+    uint32_t parent_inode_num = 2; // Root di default
+    if (parent_path[0] == '/' && parent_path[1] == '\0') {
+        parent_inode_num = 2;
+    } else {
+        parent_inode_num = ext2_resolve_path(parent_path);
+        if (parent_inode_num == 0) return -2; // Errore: Cartella madre inesistente!
+    }
+
+    uint8_t sector_buffer[512] = {0};
+    uint8_t dir_buffer[1024] = {0}; // Usiamo un buffer separato per i dati della cartella
+
+    // Leggiamo la BGDT
+    if (!ata_read_sector(4, sector_buffer)) return 0;
+    ext2_bg_desc_t bgd; uint8_t* dst = (uint8_t*)&bgd;
+    for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[i];
+    uint32_t inode_table_lba = bgd.bg_inode_table * 2;
+    
+    // Grandezza Inode
+    uint32_t inode_size = 128;
+    ata_read_sector(inode_table_lba, sector_buffer);
+    ext2_inode_t root_test; dst = (uint8_t*)&root_test;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[128 + i];
+    if ((root_test.i_mode & 0xF000) != 0x4000) inode_size = 256;
+
+    // 3. LEGGIAMO LA CARTELLA MADRE E CERCHIAMO DUPLICATI
+    uint32_t p_index = parent_inode_num - 1;
+    uint32_t p_sect_off = (p_index * inode_size) / 512;
+    uint32_t p_in_sect_off = (p_index * inode_size) % 512;
+
+    ata_read_sector(inode_table_lba + p_sect_off, sector_buffer);
+    ext2_inode_t parent_inode;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) ((uint8_t*)&parent_inode)[i] = sector_buffer[p_in_sect_off + i];
+    
+    if ((parent_inode.i_mode & 0xF000) != 0x4000) return -2; // Non è una cartella
+
+    uint32_t dir_block_lba = parent_inode.i_block[0] * 2;
+    ata_read_sector(dir_block_lba, dir_buffer);
+    ata_read_sector(dir_block_lba + 1, dir_buffer + 512);
+
+    uint32_t offset = 0;
+    uint32_t insert_offset = 0;
+    uint32_t real_len_to_shrink = 0;
+
+    // Analizziamo la cartella madre per trovare spazio vuoto e assicurarci che il nome sia libero
+    while (offset < 1024) {
+        ext2_dir_entry_t entry;
+        for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&entry)[i] = dir_buffer[offset + i];
+        if (entry.inode == 0 || entry.rec_len == 0) break;
+
+        char fname[256];
+        for(int k=0; k<entry.name_len; k++) fname[k] = dir_buffer[offset + 8 + k];
+        fname[entry.name_len] = '\0';
+
+        // Controllo Duplicato 
+        int match = 1;
+        if (entry.name_len != d_idx) match = 0;
+        else {
+            for(int k=0; k<d_idx; k++) { if (fname[k] != new_dirname[k]) { match = 0; break; } }
+        }
+        if (match) return -1; // IL NOME è GIà PRESO
+
+        uint32_t real_len = 8 + entry.name_len;
+        if (real_len % 4 != 0) real_len += 4 - (real_len % 4);
+
+        if (entry.rec_len > real_len + 16) {
+            insert_offset = offset;
+            real_len_to_shrink = real_len;
+        }
+        offset += entry.rec_len;
+    }
+
+    if (insert_offset == 0 && offset > 0) return 0; // Nessuno spazio libero!
+
+
+    // 4. CREAZIONE FISICA: ALLOCAZIONE
+    uint32_t new_block = ext2_allocate_block();
+    uint32_t new_inode = ext2_allocate_inode();
+    if (new_block == 0 || new_inode == 0) return 0;
+
+    // 5. SCRIVIAMO '.' e '..' NEL NUOVO BLOCCO
+    for(int i=0; i<512; i++) {sector_buffer[i] = 0;}
+    
+    ext2_dir_entry_t dot;
+    dot.inode = new_inode; dot.rec_len = 12; dot.name_len = 1; dot.file_type = 2;
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) sector_buffer[i] = ((uint8_t*)&dot)[i];
+    sector_buffer[8] = '.';
+
+    ext2_dir_entry_t dotdot;
+    dotdot.inode = parent_inode_num; // Ora punta alla vera cartella madre
+    dotdot.rec_len = 1012; dotdot.name_len = 2; dotdot.file_type = 2;
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) sector_buffer[12 + i] = ((uint8_t*)&dotdot)[i];
+    sector_buffer[20] = '.'; sector_buffer[21] = '.';
+
+    ata_write_sector(new_block * 2, sector_buffer);
+    for(int i=0; i<512; i++) {sector_buffer[i] = 0;}
+    ata_write_sector((new_block * 2) + 1, sector_buffer);
+
+    // 6. CREIAMO LA CARTA D'IDENTITÀ (INODE) DELLA NUOVA CARTELLA
+    uint32_t n_index = new_inode - 1;
+    uint32_t n_sect_off = (n_index * inode_size) / 512;
+    uint32_t n_in_sect_off = (n_index * inode_size) % 512;
+
+    ata_read_sector(inode_table_lba + n_sect_off, sector_buffer);
+    
+    ext2_inode_t new_dir_inode;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) ((uint8_t*)&new_dir_inode)[i] = 0;
+    new_dir_inode.i_mode = 0x41ED; 
+    new_dir_inode.i_size = 1024;   
+    new_dir_inode.i_links_count = 2; 
+    new_dir_inode.i_blocks = 2; 
+    new_dir_inode.i_block[0] = new_block; 
+
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) sector_buffer[n_in_sect_off + i] = ((uint8_t*)&new_dir_inode)[i];
+    ata_write_sector(inode_table_lba + n_sect_off, sector_buffer);
+
+    // 7. AGGIUNGIAMO IL NOME ALLA CARTELLA MADRE
+    ext2_dir_entry_t prev_entry;
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&prev_entry)[i] = dir_buffer[insert_offset + i];
+    
+    uint16_t old_rec_len = prev_entry.rec_len;
+    prev_entry.rec_len = real_len_to_shrink;
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) dir_buffer[insert_offset + i] = ((uint8_t*)&prev_entry)[i];
+    
+    insert_offset += real_len_to_shrink;
+    
+    ext2_dir_entry_t new_entry;
+    new_entry.inode = new_inode;
+    new_entry.rec_len = old_rec_len - real_len_to_shrink;
+    new_entry.name_len = d_idx;
+    new_entry.file_type = 2; // 2 = DIRECTORY
+    
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) dir_buffer[insert_offset + i] = ((uint8_t*)&new_entry)[i];
+    for(int i=0; i<d_idx; i++) dir_buffer[insert_offset + 8 + i] = new_dirname[i]; 
+    
+    ata_write_sector(dir_block_lba, dir_buffer);
+
+    return 1; 
+}
+
+
+
+// Legge un file dal disco usando il percorso assoluto e lo copia in memoria
+int ext2_read_file(const char* full_path, char* dest_buffer, int max_size, uint32_t* out_file_size) {
+    uint32_t target_inode_num = ext2_resolve_path(full_path);
+    if (target_inode_num == 0) return 0; 
+    
+    ext2_inode_t file_inode = ext2_get_inode_struct(target_inode_num);
+    if ((file_inode.i_mode & 0xF000) != 0x8000) return 0; // Deve essere un file
+    
+    uint32_t file_size = file_inode.i_size;
+    if (out_file_size) *out_file_size = file_size; 
+
+    if (max_size == 0) return 1; 
+
+    if (file_size > (uint32_t)max_size) file_size = max_size;
+    if (file_size == 0) return 1;
+
+    // VFS: Usiamo il traduttore di blocchi per leggere senza intasare la RAM
+    uint32_t total_blocks = (file_size + 1023) / 1024;
+    uint8_t* stream_buffer = (uint8_t*)kmalloc(1024); // Solo 1 KB richiesto dall'Heap
+    if (!stream_buffer) return 0;
+
+    uint32_t bytes_loaded = 0;
+    for (uint32_t logical_b = 0; logical_b < total_blocks; logical_b++) {
+        uint32_t p_src = ext2_get_phys_block(&file_inode, logical_b);
+        if (p_src == 0) break; // Corruzione file
+        
+        ata_read_sector(p_src * 2, stream_buffer);
+        ata_read_sector((p_src * 2) + 1, stream_buffer + 512);
+        
+        for (int i = 0; i < 1024 && bytes_loaded < file_size; i++) {
+            dest_buffer[bytes_loaded++] = stream_buffer[i];
+        }
+    }
+    
+    kfree(stream_buffer);
+    if (bytes_loaded < (uint32_t)max_size) dest_buffer[bytes_loaded] = '\0'; 
+    return 1; 
+}
+
+// Funzione di supporto per liberare in sicurezza un singolo blocco dati (Gestisce Bitmap enormi)
+void ext2_free_block_safe(uint32_t block_num, uint32_t block_bitmap_lba) {
+    if (block_num == 0) return;
+    uint32_t bit_offset = block_num - 1;
+    uint32_t sector_offset = (bit_offset / 8) / 512;
+    uint32_t byte_in_sector = (bit_offset / 8) % 512;
+    uint8_t bit_in_byte = bit_offset % 8;
+
+    uint8_t bitmap_sec[512];
+    if (ata_read_sector(block_bitmap_lba + sector_offset, bitmap_sec)) {
+        bitmap_sec[byte_in_sector] &= ~(1 << bit_in_byte);
+        ata_write_sector(block_bitmap_lba + sector_offset, bitmap_sec);
+    }
+}
+
+// Elimina un file: nasconde il nome, libera i blocchi e ricicla l'Inode
+int ext2_delete_file(const char* full_path) {
+    // 1. SPLIT DEL PERCORSO: Separare cartella madre e nome file
+    char parent_path[256];
+    char filename[256];
+    int last_slash = -1;
+    int len = 0;
+    
+    while(full_path[len] != '\0' && len < 255) {
+        if (full_path[len] == '/') last_slash = len;
+        len++;
+    }
+    if (last_slash == -1 || len == 1) return 0; // Percorso non valido
+
+    if (last_slash == 0) { 
+        parent_path[0] = '/'; parent_path[1] = '\0';
+    } else {
+        for(int i=0; i<last_slash; i++) parent_path[i] = full_path[i];
+        parent_path[last_slash] = '\0';
+    }
+    
+    int f_idx = 0;
+    for(int i=last_slash+1; i<len; i++) filename[f_idx++] = full_path[i];
+    filename[f_idx] = '\0';
+    if (f_idx == 0) return 0;
+
+    // 2. RISOLUZIONE DELLA CARTELLA MADRE
+    uint32_t parent_inode_num = ext2_resolve_path(parent_path);
+    if (parent_inode_num == 0) return 0; // Errore: Cartella madre inesistente
+
+    uint8_t sector_buffer[512] = {0};
+    uint8_t dir_buffer[1024] = {0};
+
+    // Leggiamo la BGDT per sapere dove sono le Mappe e le Tabelle
+    if (!ata_read_sector(4, sector_buffer)) return 0;
+    ext2_bg_desc_t bgd; uint8_t* dst = (uint8_t*)&bgd;
+    for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[i];
+    
+    uint32_t inode_table_lba = bgd.bg_inode_table * 2;
+    uint32_t block_bitmap_lba = bgd.bg_block_bitmap * 2;
+    uint32_t inode_bitmap_lba = bgd.bg_inode_bitmap * 2;
+
+    uint32_t inode_size = 128;
+    ata_read_sector(inode_table_lba, sector_buffer);
+    ext2_inode_t root_test; dst = (uint8_t*)&root_test;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[128 + i];
+    if ((root_test.i_mode & 0xF000) != 0x4000) inode_size = 256;
+
+    // 3. APRIAMO LA CARTELLA MADRE E CERCHIAMO IL FILE
+    uint32_t p_index = parent_inode_num - 1;
+    uint32_t p_sect_off = (p_index * inode_size) / 512;
+    uint32_t p_in_sect_off = (p_index * inode_size) % 512;
+
+    if (!ata_read_sector(inode_table_lba + p_sect_off, sector_buffer)) return 0;
+    
+    ext2_inode_t parent_inode;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) ((uint8_t*)&parent_inode)[i] = sector_buffer[p_in_sect_off + i];
+    
+    if ((parent_inode.i_mode & 0xF000) != 0x4000) return 0; // Non è una cartella
+
+    uint32_t dir_block_lba = parent_inode.i_block[0] * 2;
+    if (!ata_read_sector(dir_block_lba, dir_buffer)) return 0;
+
+    uint32_t offset = 0;
+    uint32_t prev_offset = 0; 
+    uint32_t target_inode_num = 0;
+    uint32_t entry_rec_len = 0;
+
+    while (offset < 1024) {
+        ext2_dir_entry_t entry;
+        for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&entry)[i] = dir_buffer[offset + i];
+        
+        // SICUREZZA EXTRA: Usciamo subito se la chain è corrotta
+        if (entry.inode == 0 || entry.rec_len == 0) break;
+
+        char fname[256];
+        for (int k = 0; k < entry.name_len; k++) fname[k] = dir_buffer[offset + 8 + k];
+        fname[entry.name_len] = '\0';
+        
+        int match = 1;
+        if (entry.name_len != f_idx) match = 0;
+        else {
+            for(int k=0; k<f_idx; k++) { if (fname[k] != filename[k]) { match = 0; break; } }
+        }
+
+        if (match) {
+            target_inode_num = entry.inode;
+            entry_rec_len = entry.rec_len;
+            break; 
+        }
+        prev_offset = offset;
+        offset += entry.rec_len;
+    }
+    
+    // SE IL FILE NON ESISTE, IL DISCO NON VIENE TOCCATO
+    if (target_inode_num == 0) return 0; 
+
+    // 4. LEGGERE L'INODE DEL FILE E VERIFICARE I PERMESSI
+    uint32_t index = target_inode_num - 1;
+    uint32_t sect_off = (index * inode_size) / 512;
+    uint32_t in_sect_off = (index * inode_size) % 512;
+    
+    uint8_t temp_buffer[512]; 
+    if (!ata_read_sector(inode_table_lba + sect_off, temp_buffer)) return 0;
+    
+    ext2_inode_t target_inode;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) ((uint8_t*)&target_inode)[i] = temp_buffer[in_sect_off + i];
+
+    if ((target_inode.i_mode & 0xF000) == 0x4000) {
+        return -1; // Sicurezza: è una directory, blocca tutto
+    }
+
+    // 5. Prevenzione corruzione
+    // A. Azzeriamo l'Inode dell'entry bersaglio (Questo dice a e2fsck/e2cp che il file è davvero morto)
+    ext2_dir_entry_t target_entry;
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&target_entry)[i] = dir_buffer[offset + i];
+    target_entry.inode = 0; // IL COLPO DI GRAZIA
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) dir_buffer[offset + i] = ((uint8_t*)&target_entry)[i];
+
+    // B. Estendiamo l'entry precedente per fargli inghiottire lo spazio
+    if (prev_offset != offset) { 
+        ext2_dir_entry_t prev_entry;
+        for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&prev_entry)[i] = dir_buffer[prev_offset + i];
+        
+        prev_entry.rec_len += entry_rec_len; 
+        
+        for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) dir_buffer[prev_offset + i] = ((uint8_t*)&prev_entry)[i];
+    }
+    
+    // Unico punto in cui modifichiamo la cartella sul disco
+    ata_write_sector(dir_block_lba, dir_buffer);
+    
+    
+    // ===============================================
+    // LIBERIAMO I BLOCCHI (Diretti, Indiretti e Doppi) E L'INODE NELLA BITMAP
+    // ===============================================
+    // 1. Blocchi Diretti (0-11)
+    for (int b = 0; b < 12; b++) ext2_free_block_safe(target_inode.i_block[b], block_bitmap_lba);
+
+    
+
+    // 2. Singolo Indiretto (Blocco 12)
+    if (target_inode.i_block[12] != 0) {
+        uint32_t* ind_ptrs = (uint32_t*)kmalloc(1024);
+        if (ind_ptrs) {
+            ata_read_sector(target_inode.i_block[12] * 2, (uint8_t*)ind_ptrs);
+            ata_read_sector((target_inode.i_block[12] * 2) + 1, ((uint8_t*)ind_ptrs) + 512);
+            for (int ib = 0; ib < 256; ib++) {ext2_free_block_safe(ind_ptrs[ib], block_bitmap_lba);}
+            kfree(ind_ptrs);
+        }
+        ext2_free_block_safe(target_inode.i_block[12], block_bitmap_lba); 
+    }
+
+    // 3. Doppio Indiretto (Blocco 13)
+    if (target_inode.i_block[13] != 0) {
+        uint32_t* mast_ptrs = (uint32_t*)kmalloc(1024);
+        uint32_t* sub_ptrs = (uint32_t*)kmalloc(1024);
+        if (mast_ptrs && sub_ptrs) {
+            ata_read_sector(target_inode.i_block[13] * 2, (uint8_t*)mast_ptrs);
+            ata_read_sector((target_inode.i_block[13] * 2) + 1, ((uint8_t*)mast_ptrs) + 512);
+            for (int m = 0; m < 256; m++) {
+                if (mast_ptrs[m] != 0) {
+                    ata_read_sector(mast_ptrs[m] * 2, (uint8_t*)sub_ptrs);
+                    ata_read_sector((mast_ptrs[m] * 2) + 1, ((uint8_t*)sub_ptrs) + 512);
+                    for (int s = 0; s < 256; s++) {ext2_free_block_safe(sub_ptrs[s], block_bitmap_lba);}
+                    ext2_free_block_safe(mast_ptrs[m], block_bitmap_lba);
+                }
+            }
+        }
+        if(mast_ptrs) kfree(mast_ptrs);
+        if(sub_ptrs) kfree(sub_ptrs);
+        ext2_free_block_safe(target_inode.i_block[13], block_bitmap_lba);
+    }
+
+
+
+    // 4. Infine, liberiamo l'Inode stesso
+    uint8_t bitmap_buffer[512];
+    if (ata_read_sector(inode_bitmap_lba, bitmap_buffer)) {
+        uint32_t byte_idx = (target_inode_num - 1) / 8;
+        uint8_t bit = (target_inode_num - 1) % 8;
+        bitmap_buffer[byte_idx] &= ~(1 << bit);
+        ata_write_sector(inode_bitmap_lba, bitmap_buffer);
+    }
+    
+
+    return 1; 
+}
+
+
+// ==============================================================================
+// MOTORE DI DISTRUZIONE RICORSIVA EXT2 (Non reversibile)
+// ==============================================================================
+
+// Funzione interna che vaporizza un Inode e tutto ciò che contiene
+void ext2_wipe_inode(uint32_t target_inode_num) {
+    if (target_inode_num == 0) return;
+
+    // Usiamo kmalloc per non intasare lo Stack del Kernel durante la ricorsione
+    uint8_t* sector_buffer = (uint8_t*)kmalloc(512);
+    if (!sector_buffer) return;
+
+    if (!ata_read_sector(4, sector_buffer)) { kfree(sector_buffer); return; }
+    ext2_bg_desc_t bgd; uint8_t* dst = (uint8_t*)&bgd;
+    for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[i];
+
+    uint32_t inode_table_lba = bgd.bg_inode_table * 2;
+    uint32_t block_bitmap_lba = bgd.bg_block_bitmap * 2;
+    uint32_t inode_bitmap_lba = bgd.bg_inode_bitmap * 2;
+
+    uint32_t inode_size = 128;
+    ata_read_sector(inode_table_lba, sector_buffer);
+    ext2_inode_t root_test; dst = (uint8_t*)&root_test;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[128 + i];
+    if ((root_test.i_mode & 0xF000) != 0x4000) inode_size = 256;
+
+    uint32_t index = target_inode_num - 1;
+    uint32_t sect_off = (index * inode_size) / 512;
+    uint32_t in_sect_off = (index * inode_size) % 512;
+
+    if (!ata_read_sector(inode_table_lba + sect_off, sector_buffer)) { kfree(sector_buffer); return; }
+    ext2_inode_t target_inode;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) ((uint8_t*)&target_inode)[i] = sector_buffer[in_sect_off + i];
+
+    // ===============================================
+    // SE E' UNA CARTELLA, LA SVUOTIAMO RICORSIVAMENTE
+    // ===============================================
+    if ((target_inode.i_mode & 0xF000) == 0x4000) {
+        uint8_t* dir_buffer = (uint8_t*)kmalloc(1024); // Raddoppiato
+        if (dir_buffer) {
+            for (int b = 0; b < 12; b++) {
+                if (target_inode.i_block[b] == 0) break;
+                uint32_t dir_lba = target_inode.i_block[b] * 2;
+                
+                // Leggiamo entrambi i settori del blocco in un colpo solo
+                if (ata_read_sector(dir_lba, dir_buffer) && ata_read_sector(dir_lba + 1, dir_buffer + 512)) {
+                    uint32_t offset = 0;
+                    while (offset < 1024) {
+                        ext2_dir_entry_t entry;
+                        for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&entry)[i] = dir_buffer[offset + i];
+                        if (entry.inode == 0 || entry.rec_len == 0) break;
+
+                        char fname[256];
+                        for (int k = 0; k < entry.name_len; k++) fname[k] = dir_buffer[offset + 8 + k];
+                        fname[entry.name_len] = '\0';
+
+                        int is_dot = (entry.name_len == 1 && fname[0] == '.');
+                        int is_dotdot = (entry.name_len == 2 && fname[0] == '.' && fname[1] == '.');
+
+                        if (!is_dot && !is_dotdot) {
+                            ext2_wipe_inode(entry.inode);
+                        }
+                        offset += entry.rec_len;
+                    }
+                }
+            }
+            kfree(dir_buffer);
+        }
+    }
+
+    // ===============================================
+    // LIBERIAMO I BLOCCHI (Diretti, Indiretti e Doppi) E L'INODE NELLA BITMAP
+    // ===============================================
+    // 1. Blocchi Diretti (0-11)
+    for (int b = 0; b < 12; b++) ext2_free_block_safe(target_inode.i_block[b], block_bitmap_lba);
+
+    // 2. Singolo Indiretto (Blocco 12)
+    if (target_inode.i_block[12] != 0) {
+        uint32_t* ind_ptrs = (uint32_t*)kmalloc(1024);
+        if (ind_ptrs) {
+            ata_read_sector(target_inode.i_block[12] * 2, (uint8_t*)ind_ptrs);
+            ata_read_sector((target_inode.i_block[12] * 2) + 1, ((uint8_t*)ind_ptrs) + 512);
+            for (int ib = 0; ib < 256; ib++) {ext2_free_block_safe(ind_ptrs[ib], block_bitmap_lba);}
+            kfree(ind_ptrs);
+        }
+        ext2_free_block_safe(target_inode.i_block[12], block_bitmap_lba); 
+    }
+
+    // 3. Doppio Indiretto (Blocco 13)
+    if (target_inode.i_block[13] != 0) {
+        uint32_t* mast_ptrs = (uint32_t*)kmalloc(1024);
+        uint32_t* sub_ptrs = (uint32_t*)kmalloc(1024);
+        if (mast_ptrs && sub_ptrs) {
+            ata_read_sector(target_inode.i_block[13] * 2, (uint8_t*)mast_ptrs);
+            ata_read_sector((target_inode.i_block[13] * 2) + 1, ((uint8_t*)mast_ptrs) + 512);
+            for (int m = 0; m < 256; m++) {
+                if (mast_ptrs[m] != 0) {
+                    ata_read_sector(mast_ptrs[m] * 2, (uint8_t*)sub_ptrs);
+                    ata_read_sector((mast_ptrs[m] * 2) + 1, ((uint8_t*)sub_ptrs) + 512);
+                    for (int s = 0; s < 256; s++) {ext2_free_block_safe(sub_ptrs[s], block_bitmap_lba);}
+                    ext2_free_block_safe(mast_ptrs[m], block_bitmap_lba);
+                }
+            }
+        }
+        if(mast_ptrs) kfree(mast_ptrs);
+        if(sub_ptrs) kfree(sub_ptrs);
+        ext2_free_block_safe(target_inode.i_block[13], block_bitmap_lba);
+    }
+
+    // 4. Infine, liberiamo l'Inode stesso
+    uint8_t bitmap_buffer[512];
+    if (ata_read_sector(inode_bitmap_lba, bitmap_buffer)) {
+        uint32_t byte_idx = (target_inode_num - 1) / 8;
+        uint8_t bit = (target_inode_num - 1) % 8;
+        bitmap_buffer[byte_idx] &= ~(1 << bit);
+        ata_write_sector(inode_bitmap_lba, bitmap_buffer);
+    }
+
+    kfree(sector_buffer); // Pulizia RAM Kerne
+}
+
+// L'API Pubblica: Rimuove la cartella dall'albero Ext2 e scatena l'annientamento
+int ext2_remove_directory(const char* full_path) {
+    char parent_path[256];
+    char dirname[256];
+    int last_slash = -1;
+    int len = 0;
+
+    while(full_path[len] != '\0' && len < 255) {
+        if (full_path[len] == '/') last_slash = len;
+        len++;
+    }
+    if (last_slash == -1 || len <= 1) return 0; // Previene l'eliminazione della Root (/)
+
+    if (last_slash == 0) {
+        parent_path[0] = '/'; parent_path[1] = '\0';
+    } else {
+        for(int i=0; i<last_slash; i++) parent_path[i] = full_path[i];
+        parent_path[last_slash] = '\0';
+    }
+
+    int d_idx = 0;
+    for(int i=last_slash+1; i<len; i++) dirname[d_idx++] = full_path[i];
+    dirname[d_idx] = '\0';
+    if (d_idx == 0) return 0;
+
+    uint32_t parent_inode_num = ext2_resolve_path(parent_path);
+    if (parent_inode_num == 0) return 0;
+
+    uint8_t sector_buffer[512] = {0};
+    uint8_t dir_buffer[1024] = {0};
+
+    if (!ata_read_sector(4, sector_buffer)) return 0;
+    ext2_bg_desc_t bgd; uint8_t* dst = (uint8_t*)&bgd;
+    for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[i];
+
+    uint32_t inode_table_lba = bgd.bg_inode_table * 2;
+    uint32_t inode_size = 128;
+    ata_read_sector(inode_table_lba, sector_buffer);
+    ext2_inode_t root_test; dst = (uint8_t*)&root_test;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[128 + i];
+    if ((root_test.i_mode & 0xF000) != 0x4000) inode_size = 256;
+
+    uint32_t p_index = parent_inode_num - 1;
+    uint32_t p_sect_off = (p_index * inode_size) / 512;
+    uint32_t p_in_sect_off = (p_index * inode_size) % 512;
+
+    if (!ata_read_sector(inode_table_lba + p_sect_off, sector_buffer)) return 0;
+    ext2_inode_t parent_inode;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) ((uint8_t*)&parent_inode)[i] = sector_buffer[p_in_sect_off + i];
+    if ((parent_inode.i_mode & 0xF000) != 0x4000) return 0;
+
+    uint32_t dir_block_lba = parent_inode.i_block[0] * 2;
+    if (!ata_read_sector(dir_block_lba, dir_buffer)) return 0;
+
+    uint32_t offset = 0;
+    uint32_t prev_offset = 0;
+    uint32_t target_inode_num = 0;
+    uint32_t entry_rec_len = 0;
+
+    while (offset < 1024) {
+        ext2_dir_entry_t entry;
+        for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&entry)[i] = dir_buffer[offset + i];
+        if (entry.inode == 0 || entry.rec_len == 0) break;
+
+        char fname[256];
+        for (int k = 0; k < entry.name_len; k++) fname[k] = dir_buffer[offset + 8 + k];
+        fname[entry.name_len] = '\0';
+
+        int match = 1;
+        if (entry.name_len != d_idx) match = 0;
+        else {
+            for(int k=0; k<d_idx; k++) { if (fname[k] != dirname[k]) { match = 0; break; } }
+        }
+
+        if (match) {
+            target_inode_num = entry.inode;
+            entry_rec_len = entry.rec_len;
+            break;
+        }
+        prev_offset = offset;
+        offset += entry.rec_len;
+    }
+
+    if (target_inode_num == 0) return 0; 
+
+    // VERIFICA FINALE: Controlliamo che sia DAVVERO una cartella prima di distruggere
+    uint32_t index = target_inode_num - 1;
+    uint32_t sect_off = (index * inode_size) / 512;
+    uint32_t in_sect_off = (index * inode_size) % 512;
+
+    uint8_t temp_buffer[512];
+    if (!ata_read_sector(inode_table_lba + sect_off, temp_buffer)) return 0;
+
+    ext2_inode_t target_inode;
+    for(size_t i=0; i<sizeof(ext2_inode_t); i++) ((uint8_t*)&target_inode)[i] = temp_buffer[in_sect_off + i];
+
+    if ((target_inode.i_mode & 0xF000) != 0x4000) {
+        return -1; // ERRORE: L'utente sta provando a usare rmdir su un file (.txt, .edxi)
+    }
+
+    // SCUCIAMO IL NOME DALLA CARTELLA MADRE E AZZERIAMO L'INODE
+    ext2_dir_entry_t target_entry;
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&target_entry)[i] = dir_buffer[offset + i];
+    target_entry.inode = 0; // IL COLPO DI GRAZIA
+    for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) dir_buffer[offset + i] = ((uint8_t*)&target_entry)[i];
+
+    if (prev_offset != offset) {
+        ext2_dir_entry_t prev_entry;
+        for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) ((uint8_t*)&prev_entry)[i] = dir_buffer[prev_offset + i];
+        prev_entry.rec_len += entry_rec_len;
+        for(size_t i=0; i<sizeof(ext2_dir_entry_t); i++) dir_buffer[prev_offset + i] = ((uint8_t*)&prev_entry)[i];
+    }
+    ata_write_sector(dir_block_lba, dir_buffer);
+
+    // INNESCHIAMO LA BOMBA RICORSIVA
+    ext2_wipe_inode(target_inode_num);
+
+    return 1;
+}
+
+
+
+// Motore di Copia VFS a Flusso Continuo (Consuma solo 1KB di RAM, zero limiti di file)
+int ext2_copy_file(const char* src_path, const char* dest_path) {
+    // 0. CONTROLLO LUCCHETTO
+    if (vfs_lock == 1) return -6; // Codice Errore: DISCO OCCUPATO
+    
+    uint32_t src_size = 0;
+    
+    // 1. Otteniamo la grandezza senza caricare il file
+    if (!ext2_read_file(src_path, NULL, 0, &src_size)) return -3;
+    if (src_size == 0) return -4; // File vuoto, nulla da copiare
+    
+    // 2. Risolviamo l'Inode sorgente
+    uint32_t src_inode_num = ext2_resolve_path(src_path);
+    if (!src_inode_num) return -3;
+
+
+    // DA QUI IN POI, NESSUN ALTRO PUÒ TOCCARE IL DISCO
+    vfs_lock = 1;
+
+    // 3. PRE-ALLOCAZIONE! Creiamo il file di destinazione vuoto (pieno di zeri)
+    int alloc_res = ext2_write_file(dest_path, NULL, src_size);
+    if (alloc_res != 1) { vfs_lock = 0; return alloc_res; } // Sblocchiamo in caso di errore
+    
+    uint32_t dest_inode_num = ext2_resolve_path(dest_path);
+
+    // 4. Carichiamo in RAM le carte d'identità dei due file
+    ext2_inode_t src_inode = ext2_get_inode_struct(src_inode_num);
+    ext2_inode_t dest_inode = ext2_get_inode_struct(dest_inode_num);
+
+    // 5. Setup Grafica
+    if (src_size > 131072) {
+        show_progress_bar = 1;
+        progress_total = src_size * 2; 
+        progress_current = 0;
+    } else show_progress_bar = 0;
+
+    // =======================================================
+    // IL MOTORE VFS (STREAMING CHUNKING)
+    // =======================================================
+    uint32_t total_blocks = (src_size + 1023) / 1024;
+    uint8_t* stream_buffer = (uint8_t*)kmalloc(1024); // SOLO 1 KB DI RAM
+    if (!stream_buffer) { vfs_lock = 0; return -5; } // Sblocchiamo in caso di errore OOM
+
+    // Copiamo fisicamente 1 Kilobyte alla volta, seguendo il labirinto dei puntatori
+    for (uint32_t logical_b = 0; logical_b < total_blocks; logical_b++) {
+        
+        // La Pietra di Rosetta ci rivela l'indirizzo fisico reale
+        uint32_t p_src = ext2_get_phys_block(&src_inode, logical_b);
+        uint32_t p_dest = ext2_get_phys_block(&dest_inode, logical_b);
+
+        if (p_src == 0 || p_dest == 0) break; // Sicurezza corruzione
+
+        // Legge 1024 byte dalla sorgente
+        ata_read_sector(p_src * 2, stream_buffer);
+        ata_read_sector((p_src * 2) + 1, stream_buffer + 512);
+
+        // Scrive 1024 byte nella destinazione
+        ata_write_sector(p_dest * 2, stream_buffer);
+        ata_write_sector((p_dest * 2) + 1, stream_buffer + 512);
+    }
+    
+    kfree(stream_buffer);
+    show_progress_bar = 0;
+
+    // OPERAZIONE FINITA: TOGLIAMO IL LUCCHETTO
+    vfs_lock = 0;
+    return 1; 
+}
+
+
+// ==========================================
+// LOADABLE KERNEL MODULES (LKM) LOADER
+// ==========================================
+int load_driver(const char* path) {
+    uint32_t file_size = 0;
+    
+    // 1. Chiediamo al file system quanto è grande il file del driver
+    if (!ext2_read_file(path, NULL, 0, &file_size)) return -1; // File inesistente
+    if (file_size == 0) return -2; // File vuoto
+
+    // 2. Allochiamo la RAM direttamente nel Kernel Heap (Ring 0, Nessun limite di Page Table)
+    void* driver_mem = kmalloc(file_size);
+    if (!driver_mem) return -3; // OOM (Memoria Esaurita)
+
+    // 3. Copiamo fisicamente il codice macchina dal disco alla RAM
+    if (!ext2_read_file(path, (char*)driver_mem, file_size, &file_size)) {
+        kfree(driver_mem);
+        return -4; // Errore di lettura disco
+    }
+
+    // 4. LA MAGIA: Passiamo al driver la SUA STESSA posizione in memoria
+    int (*driver_entry)(kernel_api_t*, void*) = (int (*)(kernel_api_t*, void*))driver_mem;
+
+    // 5. Inneschiamo il Driver passandogli la "driver_api" e la sua Base (driver_mem)
+    int result = driver_entry(&driver_api, driver_mem);
+    
+    // Se il driver restituisce 0 (Fallimento) o se non deve restare in memoria residente
+    // per adesso liberiamo la memoria. In futuro i driver audio resteranno attivi!
+    
+    
+    return result; 
+}
+
+
+// ==========================================
+// GESTIONE DELLA MEMORIA (HEAP)
+// ==========================================
+// Decidiamo di far partire il nostro "Magazzino" dal Mega numero 16 della RAM
+// (Un posto sicuro e lontano dal Kernel e dalla scheda video)
+#define HEAP_START 0x01000000 
+#define HEAP_SIZE  0x01000000 // 16 Megabyte di spazio a disposizione
+
+
+// ==========================================
+// PHYSICAL FRAME ALLOCATOR (Dinamico)
+// ==========================================
+uint32_t system_ram_mb = 0;
+uint32_t pfa_start_addr = 0x02000000; // La RAM delle app inizia sempre dopo i primi 32 MB
+uint32_t pfa_max_frames = 0;
+uint32_t pfa_total_memory = 0;
+
+// Supportiamo fino a 1 GigaByte di RAM fisica (262144 frame / 32 = 8192 interi)
+uint32_t pfa_bitmap[8192]; 
+
+void init_pfa(uint32_t total_ram_mb) {
+    system_ram_mb = total_ram_mb;
+    
+    // Cap di sicurezza a 1024 MB (1 GigaByte) per non far esplodere l'array
+    if (system_ram_mb > 1024) system_ram_mb = 1024;
+    
+    // Il Kernel, la VRAM e l'Heap usano i primi 32 MB. Il resto è per le App.
+    if (system_ram_mb <= 32) {
+        pfa_max_frames = 0; pfa_total_memory = 0;
+    } else {
+        pfa_total_memory = (system_ram_mb - 32) * 1024 * 1024;
+        pfa_max_frames = pfa_total_memory / 4096;
+    }
+
+    // Inizializziamo l'array mappando solo la RAM esistente
+    for (uint32_t i = 0; i < 8192; i++) {
+        if (i < (pfa_max_frames / 32)) {
+            pfa_bitmap[i] = 0; // Frame fisicamente esistente e libero
+        } else {
+            pfa_bitmap[i] = 0xFFFFFFFF; // RAM inesistente, bloccata in eterno
+        }
+    }
+}
+
+uint32_t pfa_alloc_frame() {
+    if (pfa_max_frames == 0) return 0;
+    
+    for (uint32_t i = 0; i < (pfa_max_frames / 32) + 1; i++) {
+        if (pfa_bitmap[i] != 0xFFFFFFFF) { 
+            for (int bit = 0; bit < 32; bit++) {
+                if (!(pfa_bitmap[i] & (1 << bit))) {
+                    pfa_bitmap[i] |= (1 << bit); // Lo marchiamo occupato
+                    uint32_t frame_index = (i * 32) + bit;
+                    if (frame_index >= pfa_max_frames) return 0; // Sicurezza fine RAM
+                    return pfa_start_addr + (frame_index * 4096);
+                }
+            }
+        }
+    }
+    return 0; 
+}
+
+void pfa_free_frame(uint32_t physical_address) {
+    if (physical_address < pfa_start_addr || physical_address >= pfa_start_addr + pfa_total_memory) return;
+    uint32_t frame_index = (physical_address - pfa_start_addr) / 4096;
+    uint32_t array_index = frame_index / 32;
+    uint32_t bit_index = frame_index % 32;
+    pfa_bitmap[array_index] &= ~(1 << bit_index); // Lo liberiamo
+}
+
+
+
+// L'intestazione segreta di ogni blocco (Con Padding)
+typedef struct mem_block {
+    size_t size;            
+    int is_free;            
+    struct mem_block* next; 
+    // Riempiamo lo spazio residuo per far pesare questa struct esattamente 4096 byte
+    uint8_t padding[4096 - 12]; 
+} mem_block_t;
+
+
+// Il "Capo" della lista
+mem_block_t* heap_head = (mem_block_t*)HEAP_START;
+
+// Inizializza la RAM (Da chiamare all'avvio)
+void init_heap() {
+    heap_head->size = HEAP_SIZE - sizeof(mem_block_t);
+    heap_head->is_free = 1;
+    heap_head->next = NULL;
+}
+
+
+// Alloca la memoria dinamica
+void* kmalloc(size_t size) {
+    // Arrotondiamo la dimensione richiesta al multiplo di 4KB più vicino
+    if (size % 4096 != 0) size = size + (4096 - (size % 4096));
+
+    mem_block_t* current = heap_head;
+    while (current != NULL) {
+        if (current->is_free && current->size >= size) {
+            if (current->size > size + sizeof(mem_block_t) + 16) {
+                mem_block_t* new_block = (mem_block_t*)((uint8_t*)current + sizeof(mem_block_t) + size);
+                new_block->size = current->size - size - sizeof(mem_block_t);
+                new_block->is_free = 1;
+                new_block->next = current->next;
+                current->size = size;
+                current->next = new_block;
+            }
+            current->is_free = 0;
+            return (void*)((uint8_t*)current + sizeof(mem_block_t));
+        }
+        current = current->next;
+    }
+    return NULL; 
+}
+
+// Libera la memoria
+void kfree(void* ptr) {
+    if (!ptr) return;
+    
+    // Facciamo un passo indietro per leggere l'intestazione segreta
+    mem_block_t* block = (mem_block_t*)((uint8_t*)ptr - sizeof(mem_block_t));
+    block->is_free = 1;
+    
+    // De-frammentazione: Se due blocchi vicini sono liberi, li fondiamo in uno solo
+    mem_block_t* current = heap_head;
+    while (current != NULL) {
+        if (current->is_free && current->next != NULL && current->next->is_free) {
+            current->size += sizeof(mem_block_t) + current->next->size;
+            current->next = current->next->next;
+        } else {
+            current = current->next;
+        }
+    }
+}
+
+// ==========================================
+// DMA MEMORY ALLOCATOR (Sotto i 16MB)
+// ==========================================
+// Il chip DMA antico non vede oltre 16MB. Riserviamo 2 Megabyte (da 2MB a 4MB) per l'audio
+#define DMA_HEAP_START 0x00200000 
+#define DMA_HEAP_SIZE  (2 * 1024 * 1024)
+
+mem_block_t* dma_heap_head = (mem_block_t*)DMA_HEAP_START;
+
+void init_dma_heap() {
+    dma_heap_head->size = DMA_HEAP_SIZE - sizeof(mem_block_t);
+    dma_heap_head->is_free = 1;
+    dma_heap_head->next = NULL;
+}
+
+// Identico a kmalloc, ma pesca dal magazzino basso
+void* kmalloc_dma(size_t size) {
+    if (size % 4096 != 0) size = size + (4096 - (size % 4096));
+
+    mem_block_t* current = dma_heap_head;
+    while (current != NULL) {
+        if (current->is_free && current->size >= size) {
+            // FONDAMENTALE PER IL DMA: Il blocco non deve attraversare un confine di 64KB
+            // Se lo fa, scartiamo questo blocco e passiamo al prossimo.
+            uint32_t start_addr = (uint32_t)current + sizeof(mem_block_t);
+            uint32_t end_addr = start_addr + size - 1;
+            // Modifica il divisore per il DMA a 16-bit
+            if ((start_addr / 131072) != (end_addr / 131072)) {
+                current = current->next;
+                continue;
+            }
+
+            if (current->size > size + sizeof(mem_block_t) + 16) {
+                mem_block_t* new_block = (mem_block_t*)((uint8_t*)current + sizeof(mem_block_t) + size);
+                new_block->size = current->size - size - sizeof(mem_block_t);
+                new_block->is_free = 1;
+                new_block->next = current->next;
+                current->size = size;
+                current->next = new_block;
+            }
+            current->is_free = 0;
+            return (void*)start_addr;
+        }
+        current = current->next;
+    }
+    return NULL; 
+}
+
+// Libera la memoria nel magazzino basso (DMA)
+void kfree_dma(void* ptr) {
+    if (!ptr) return;
+    
+    // Leggiamo l'intestazione segreta
+    mem_block_t* block = (mem_block_t*)((uint8_t*)ptr - sizeof(mem_block_t));
+    block->is_free = 1;
+    
+    // De-frammentazione del DMA Heap
+    mem_block_t* current = dma_heap_head;
+    while (current != NULL) {
+        if (current->is_free && current->next != NULL && current->next->is_free) {
+            current->size += sizeof(mem_block_t) + current->next->size;
+            current->next = current->next->next;
+        } else {
+            current = current->next;
+        }
+    }
+}
+
+// Quando un'app finisce, salta qui dentro per suicidarsi e liberare la RAM
+void kill_process() {
+    process_table[current_pid].active = 0;
+    kfree((void*)process_table[current_pid].stack_base);
+    
+    // Restituiamo tutti i "mattoncini" fisici (Frame) usati da questa App
+    uint32_t* pt = process_table[current_pid].page_table;
+    for (int i = 0; i < 1024; i++) {
+        if (pt[i] & 0x01) { // Se il bit 0 (Present) è a 1
+            // Mascheriamo gli ultimi 12 bit (i flag) per ottenere l'indirizzo fisico puro
+            pfa_free_frame(pt[i] & 0xFFFFF000); 
+        }
+    }
+    kfree(pt); // Infine, liberiamo la Page Table stessa
+    
+    // ==========================================================
+    // IL SALVAVITA: Riaccendiamo il Timer prima di morire!
+    // ==========================================================
+    asm volatile("sti");
+    
+    // Usiamo 'hlt' per far riposare la CPU mentre aspettiamo la falce dello Scheduler
+    while(1) { asm volatile("hlt"); } 
+}
+
+
+// Helper: Trova il primo PID libero
+int get_free_pid() {
+    for(int i=1; i<MAX_PROCESSES; i++) {
+        if(!process_table[i].active) return i;
+    }
+    return -1;
+}
+
+int create_process(void (*entry_point)(), int window_id, uint32_t* private_pt, int is_virtual, int parent_window_id, int pid) {
+    if(pid <= 0 || pid >= MAX_PROCESSES) return -1;
+
+    uint32_t* stack = (uint32_t*)kmalloc(4096); // 4KB di Stack privato
+    process_table[pid].stack_base = (uint32_t)stack;
+    process_table[pid].page_table = private_pt; // SALVIAMO LA PAGE TABLE
+    process_table[pid].linked_window = window_id;
+    process_table[pid].parent_window = parent_window_id;
+    process_table[pid].is_critical_io = 0; // INIZIALIZZAZIONE DELLO SCUDO
+
+    // Andiamo in cima alla RAM privata e scendiamo al contrario
+    uint32_t* st = (uint32_t*)((uint8_t*)stack + 4096);
+
+    // 1. Se l'app esegue 'ret', salterà qui per suicidarsi pulendo la RAM
+    *(--st) = (uint32_t)kill_process;
+
+    
+    
+    // 2. L'Hardware Frame: i valori esatti che il comando 'iret' si aspetta di trovare
+    if (is_virtual) {
+        // === LANCIO IN RING 3 (USER MODE) ===
+        // Per andare in Ring 3, IRET pretende 5 valori
+        *(--st) = 0x23;                 // SS  (Segmento Dati Utente: 0x20 + Ring 3)
+        *(--st) = 0x40020000;           // ESP (User Stack: 128KB dopo l'inizio. Spazio per le big apps!)
+        *(--st) = 0x0202;               // EFLAGS (Interrupt Abilitati)
+        *(--st) = 0x1B;                 // CS  (Segmento Codice Utente: 0x18 + Ring 3)
+        *(--st) = (uint32_t)0x40000010; // EIP (Punta dopo l'header EDXI)
+    } else {
+        // === LANCIO IN RING 0 (KERNEL MODE / VECCHIE APP PIATTE) ===
+        // Per restare in Ring 0, IRET pretende solo 3 valori
+        *(--st) = 0x0202;               // EFLAGS
+        uint16_t cs; asm volatile("mov %%cs, %0" : "=r"(cs));
+        *(--st) = (uint32_t)cs;         // CS
+        *(--st) = (uint32_t)entry_point;// EIP
+    }
+
+    
+    // 3. I Registri Generali: i valori esatti che il comando 'popal' si aspetta!
+    // Vanno inseriti in ordine opposto (EAX in cima, EDI in fondo)
+    *(--st) = 0; // EAX
+    *(--st) = 0; // ECX
+    *(--st) = 0; // EDX
+    *(--st) = 0; // EBX
+    *(--st) = 0; // ESP (ignorato dal popal, ma lo spazio serve)
+    *(--st) = 0; // EBP
+    *(--st) = 0; // ESI
+    *(--st) = 0; // EDI
+
+    // 4. NUOVO: I Registri di Segmento (Vitali per non far crashare il Ring 3)
+    uint32_t data_seg = is_virtual ? 0x23 : 0x10; // 0x23 per Utenti, 0x10 per Kernel
+    *(--st) = data_seg; // DS
+    *(--st) = data_seg; // ES
+    *(--st) = data_seg; // FS
+    *(--st) = data_seg; // GS
+
+    // Salviamo la posizione in cui siamo arrivati
+    process_table[pid].esp = (uint32_t)st;
+    process_table[pid].active = 1;
+    
+    process_table[pid].waiting_for_input = 0;
+    return pid;
+}
+
+
+// ==========================================
+// GDT (GLOBAL DESCRIPTOR TABLE) E RING 3
+// ==========================================
+
+struct gdt_entry {
+    uint16_t limit_low; uint16_t base_low; uint8_t base_middle;
+    uint8_t access; uint8_t granularity; uint8_t base_high;
+} __attribute__((packed));
+
+struct gdt_ptr {
+    uint16_t limit; uint32_t base;
+} __attribute__((packed));
+
+struct gdt_entry gdt[6]; // ORA SONO 6 CARTE D'IDENTITà
+struct gdt_ptr gdtp;
+
+void gdt_set_gate(int num, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran) {
+    gdt[num].base_low = (base & 0xFFFF); gdt[num].base_middle = (base >> 16) & 0xFF;
+    gdt[num].base_high = (base >> 24) & 0xFF; gdt[num].limit_low = (limit & 0xFFFF);
+    gdt[num].granularity = (limit >> 16) & 0x0F; gdt[num].granularity |= gran & 0xF0;
+    gdt[num].access = access;
+}
+
+// STRUTTURA DEL TSS (Il ponte di emergenza per il Ring 0)
+struct tss_entry_struct {
+    uint32_t prev_tss;
+    uint32_t esp0;     // LO STACK DI EMERGENZA (Kernel Stack)
+    uint32_t ss0;      // Il segmento dati del Kernel
+    uint32_t esp1, ss1, esp2, ss2, cr3, eip, eflags, eax, ecx, edx, ebx, esp, ebp, esi, edi, es, cs, ss, ds, fs, gs, ldt, trap, iomap_base;
+} __attribute__((packed));
+
+struct tss_entry_struct tss_entry;
+
+void write_tss(int32_t num, uint16_t ss0, uint32_t esp0) {
+    uint32_t base = (uint32_t) &tss_entry;
+    uint32_t limit = sizeof(tss_entry);
+    gdt_set_gate(num, base, limit, 0xE9, 0x00);
+    for(size_t i=0; i<sizeof(tss_entry); i++) ((uint8_t*)&tss_entry)[i] = 0;
+    tss_entry.ss0  = ss0;
+    tss_entry.esp0 = esp0;
+    tss_entry.iomap_base = sizeof(tss_entry);
+}
+
+void init_gdt() {
+    gdtp.limit = (sizeof(struct gdt_entry) * 6) - 1; 
+    gdtp.base  = (uint32_t)&gdt;
+
+    gdt_set_gate(0, 0, 0, 0, 0); // Nullo
+    gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF); // Codice Kernel (Ring 0)
+    gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF); // Dati Kernel (Ring 0)
+    gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF); // Codice App (Ring 3)
+    gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF); // Dati App (Ring 3)
+    write_tss(5, 0x10, 0x0); // TSS (Entry 5)
+
+    asm volatile(
+        "lgdt %0 \n"
+        "mov $0x10, %%ax \n"
+        "mov %%ax, %%ds \n"
+        "mov %%ax, %%es \n"
+        "mov %%ax, %%fs \n"
+        "mov %%ax, %%gs \n"
+        "mov %%ax, %%ss \n"
+        "ljmp $0x08, $1f \n"
+        "1: \n"
+        "mov $0x2B, %%ax \n" // 0x28 (Entry 5) + 3 (RPL) = 0x2B
+        "ltr %%ax \n"        // Installiamo il TSS nella CPU
+        : : "m"(gdtp)
+    );
+}
+
+
+
+// ==========================================
+// TERMINAZIONE FORZATA DELLE APP (Crash)
+// ==========================================
+void terminate_faulting_app(const char* reason) {
+    print_term(reason); 
+    
+    if (current_pid > 0) {
+        process_table[current_pid].active = 0;
+        kfree((void*)process_table[current_pid].stack_base);
+        
+        // Restituiamo i frame fisici e la Page Table
+        uint32_t* pt = process_table[current_pid].page_table;
+        for (int i = 0; i < 1024; i++) {
+            if (pt[i] & 0x01) pfa_free_frame(pt[i] & 0xFFFFF000);
+        }
+        kfree(pt);
+    }
+    
+    refresh_requested = 1;
+    asm volatile("sti");
+    while(1) { asm volatile("hlt"); }
+}
+
+
+
+// ==========================================
+// SCHERMATA BLU DELLA MORTE (KERNEL PANIC)
+// ==========================================
+void kernel_panic(const char* err_msg) {
+    // 1. CHIUDIAMO LE PORTE: Niente più timer, niente più mouse. Il tempo si ferma.
+    asm volatile("cli");
+
+    // 2. Dipingiamo brutalmente tutta la RAM video di Blu Scuro
+    for (int i = 0; i < fb_width * fb_height; i++) {
+        backbuffer[i] = 0xFF0000AA; 
+    }
+
+    // 3. Disegniamo il testo di errore bypassando il Window Manager
+    draw_string("==================================================", 50, 50, 0xFFFFFFFF, 2);
+    draw_string("                   KERNEL PANIC                   ", 50, 80, 0xFFFFFFFF, 2);
+    draw_string("==================================================", 50, 110, 0xFFFFFFFF, 2);
+    
+    draw_string("Un errore fatale ha bloccato il sistema.", 50, 160, 0xFFFFFFFF, 1);
+    draw_string("Motivo dell'arresto:", 50, 190, 0xFFFFFFFF, 1);
+    
+    draw_string(err_msg, 50, 220, 0xFFFFFF00, 2); // Il messaggio di errore in Giallo
+    
+    draw_string("Sistema arrestato per prevenire corruzione dei dati.", 50, 280, 0xFFFFFFFF, 1);
+    draw_string("Riavviare fisicamente la macchina.", 50, 300, 0xFFFFFFFF, 1);
+
+    swap_buffers();
+
+    // 4. LA MORTE DELLA CPU: Un ciclo infinito in cui la CPU si mette a dormire (Halt)
+    while(1) {
+        asm volatile("hlt");
+    }
+}
+
+// --- FUNZIONI C INTELLIGENTI CHE LEGGONO IL RING ---
+// Il parametro 'cs' ci viene passato direttamente dall'Assembly
+
+void panic_generic(uint32_t cs) { 
+    if ((cs & 3) == 3) terminate_faulting_app("ERRORE APP: Eccezione Hardware. Terminata.");
+    else kernel_panic("Eccezione Hardware Non Gestita nel Kernel"); 
+}
+
+void panic_divzero(uint32_t cs) { 
+    // L'operatore bitwise '& 3' isola gli ultimi 2 bit del registro CS
+    if ((cs & 3) == 3) terminate_faulting_app("ERRORE APP: Divisione per Zero! Processo terminato.");
+    else kernel_panic("Interrupt 0x00: Divisione per Zero nel Kernel!"); 
+}
+
+void panic_gpf(uint32_t cs) { 
+    if ((cs & 3) == 3) terminate_faulting_app("ERRORE APP: Violazione di Memoria (GPF)! Terminata.");
+    else kernel_panic("Interrupt 0x0D: General Protection Fault nel Kernel!"); 
+}
+
+// ==========================================
+// GESTORE DEL PAGE FAULT (Interrupt 14)
+// ==========================================
+void panic_pagefault(uint32_t cs) { 
+    uint32_t cr2_val;
+    asm volatile("mov %%cr2, %0" : "=r" (cr2_val));
+    
+    // IL CUORE DEL DEMAND PAGING
+    if (cr2_val >= 0x40000000 && cr2_val < 0x40400000) {
+        
+        // Chiediamo alla CPU quale "Mappa" è correntemente in uso
+        // Smascheriamo gli ultimi bit per avere l'indirizzo fisico puro
+        uint32_t active_pt_addr = page_directory[256] & 0xFFFFF000;
+        
+        // Se c'è una mappa montata, cuciamo la RAM su quella
+        if (active_pt_addr != 0) {
+            uint32_t physical_frame = pfa_alloc_frame();
+            if (physical_frame == 0) {
+                terminate_faulting_app("ERRORE OOM: Memoria RAM Fisica esaurita!");
+                return;
+            }
+
+            uint8_t* frame_ptr = (uint8_t*)physical_frame;
+            for(int i = 0; i < 4096; i++) {
+                frame_ptr[i] = 0;
+            }
+            
+            uint32_t pt_index = (cr2_val - 0x40000000) / 4096;
+            
+            // Usiamo direttamente il puntatore hardware
+            uint32_t* active_pt = (uint32_t*)active_pt_addr;
+            active_pt[pt_index] = physical_frame | 0x07;
+            
+            asm volatile("invlpg (%0)" :: "r" (cr2_val) : "memory");
+            return; 
+        }
+    }
+
+    // Se arriviamo qui, il Page Fault non era previsto...
+    if ((cs & 3) == 3) {
+        char msg[100] = "ERRORE APP: Violazione di Memoria a: ";
+        char num[32]; itoa(cr2_val, num);
+        int i = 0; while(msg[i]) i++;
+        int j = 0; while(num[j]) msg[i++] = num[j++]; msg[i] = '\0';
+        terminate_faulting_app(msg);
+    } else {
+        char msg[100] = "KERNEL PANIC: Page Fault all'indirizzo: ";
+        char num[32]; itoa(cr2_val, num);
+        int i = 0; while(msg[i]) i++;
+        int j = 0; while(num[j]) msg[i++] = num[j++]; msg[i] = '\0';
+        kernel_panic(msg); 
+    }
+}
+
+// --- Leggono il CS dallo Stack della CPU ---
+// In x86, se non c'è l'Error Code, il CS è distante 4 byte dall'ESP.
+// Se c'è l'Error Code (come nel Page Fault o GPF), il CS è distante 8 byte.
+
+__attribute__((naked)) void isr_generic() { 
+    asm volatile("mov 4(%esp), %eax \n push %eax \n call panic_generic"); 
+}
+__attribute__((naked)) void isr0_divzero() { 
+    asm volatile("mov 4(%esp), %eax \n push %eax \n call panic_divzero"); 
+}
+__attribute__((naked)) void isr13_gpf() { 
+    asm volatile("mov 8(%esp), %eax \n push %eax \n call panic_gpf"); 
+}
+__attribute__((naked)) void isr14_pfault() { 
+    asm volatile(
+        "pushal \n"               // 1. Salva tutti i registri per non corrompere l'App
+        
+        // 2. Troviamo il CS: 32 byte (pushal) + 4 byte (Error Code) + 4 byte (EIP) = Offset 40
+        "mov 40(%esp), %eax \n"   
+        "push %eax \n"            // 3. Passa il CS come argomento alla funzione C
+        
+        "call panic_pagefault \n" // 4. Esegui la magia del Demand Paging
+        
+        "add $4, %esp \n"         // 5. Rimuovi l'argomento (CS) dallo Stack
+        "popal \n"                // 6. Ripristina intatti i registri dell'App
+        
+        "add $4, %esp \n"         // 7. Rimuovi l'Error Code spinto dalla CPU
+        "iret \n"                 // 8. Ritorno trionfale all'istruzione crashata!
+    ); 
+}
+
+// La singola "voce" nella rubrica telefonica della CPU
+struct idt_entry {
+    uint16_t base_low;   // Parte bassa dell'indirizzo della nostra funzione C
+    uint16_t sel;        // Il segmento di codice (Code Segment)
+    uint8_t  zero;       // Sempre zero
+    uint8_t  flags;      // Permessi (Chi può suonare questo campanello?)
+    uint16_t base_high;  // Parte alta dell'indirizzo
+} __attribute__((packed));
+
+// Il puntatore speciale che daremo in pasto alla CPU
+struct idt_ptr {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed));
+
+struct idt_entry idt[256];
+struct idt_ptr idtp;
+
+// Struttura fittizia richiesta da GCC per le interruzioni
+struct interrupt_frame; 
+
+
+
+
+// --- IL BATTITO CARDIACO E LO SCHEDULER (Interrupt 32) ---
+volatile uint32_t current_esp;
+
+volatile char last_key_pressed = 0;
+
+// Il Direttore d'Orchestra: sceglie chi deve suonare ora
+void schedule() {
+    system_ticks++;
+    
+    // --- MOTORE DEL LAMPEGGIO CURSORE ---
+    blink_counter++;
+    if (blink_counter >= 100) blink_counter = 0; // Si resetta ogni secondo
+
+    // Motore di animazione legato all'orologio hardware (100 FPS)
+    if (anim_active) {
+        // Calcoliamo quanti fotogrammi sono passati dall'inizio
+        int elapsed = anim_frames_total - anim_frames_left + 1;
+        
+        // INTERPOLAZIONE LINEARE: Posizione = Partenza + ((Distanza * Tempo_Trascorso) / Tempo_Totale)
+        // Moltiplicando prima di dividere, non perdiamo MAI un singolo pixel di precisione
+        anim_x = anim_start_x + ((anim_target_x - anim_start_x) * elapsed) / anim_frames_total;
+        anim_y = anim_start_y + ((anim_target_y - anim_start_y) * elapsed) / anim_frames_total;
+        anim_w = anim_start_w + ((anim_target_w - anim_start_w) * elapsed) / anim_frames_total;
+        anim_h = anim_start_h + ((anim_target_h - anim_start_h) * elapsed) / anim_frames_total;
+        
+        anim_frames_left--;
+        
+        if (anim_frames_left <= 0 || anim_w <= 0 || anim_h <= 0) anim_active = 0;
+        
+        refresh_requested = 1; // Forza il ridisegno del desktop a 100 Frame al Secondo
+    } 
+    else if (system_ticks % 20 == 0) {
+        refresh_requested = 1; // Comportamento normale quando non ci sono animazioni
+    }
+
+        // --- ANIMAZIONE DELLA TASKBAR FLUTTUANTE, LARGHEZZA DINAMICA E MENU ---
+    int anim_tb_changed = 0;
+    
+    // A. Animazione Verticale
+    if (taskbar_y_offset != taskbar_target_offset) {
+        if (taskbar_y_offset < taskbar_target_offset) taskbar_y_offset++;
+        else taskbar_y_offset--;
+        anim_tb_changed = 1;
+    }
+
+    // B. Animazione Orizzontale (Espansione/Compressione fluida e rapida)
+    if (taskbar_w != taskbar_target_w) {
+        if (taskbar_w < taskbar_target_w) {
+            taskbar_w += 16; // Passo di espansione
+            if (taskbar_w > taskbar_target_w) taskbar_w = taskbar_target_w;
+        } else {
+            taskbar_w -= 16; // Passo di compressione
+            if (taskbar_w < taskbar_target_w) taskbar_w = taskbar_target_w;
+        }
+        anim_tb_changed = 1;
+    }
+
+    if (anim_tb_changed) {
+        refresh_requested = 1; // Ridisegna in modo fluido
+        
+        // Sincronizzazione Magnetica: Spostiamo i Menu aperti insieme alla barra (sia Y che X dinamica!)
+        int start_menu_y = -1;
+        int start_menu_x = -1;
+        for (int m = 0; m < MAX_WINDOWS; m++) {
+            if (windows[m].active && windows[m].type == WIN_TYPE_START_MENU) {
+                windows[m].y = (fb_height - 30 - taskbar_y_offset) - windows[m].h;
+                // Il Menu resta incollato al pulsante Start che si sposta con la barra centrata
+                windows[m].x = ((fb_width - taskbar_w) / 2) + 7; 
+                start_menu_y = windows[m].y;
+                start_menu_x = windows[m].x;
+            }
+        }
+        if (start_menu_y != -1) {
+            for (int m = 0; m < MAX_WINDOWS; m++) {
+                if (windows[m].active && windows[m].type == WIN_TYPE_APP_MENU) {
+                    windows[m].y = start_menu_y; 
+                    windows[m].x = start_menu_x + 160; // Il sottomenu segue a destra del menu Start
+                }
+            }
+        }
+    }
+
+
+    // Salviamo l'ESP nel processo che stiamo mettendo in pausa
+    process_table[current_pid].esp = current_esp;
+
+    // Cerchiamo il prossimo processo (Round Robin)
+    do {
+        current_pid++;
+        if (current_pid >= MAX_PROCESSES) current_pid = 0;
+        
+    
+    
+    // Saltiamo non solo i processi inattivi, ma ANCHE quelli che stanno dormendo in attesa di input/eventi
+    } while (process_table[current_pid].active == 0 || process_table[current_pid].waiting_for_input > 0);
+
+    // Carichiamo l'ESP del nuovo processo
+    current_esp = process_table[current_pid].esp;
+
+    // TSS: Diciamo alla CPU dove si trova lo Stack di emergenza di QUESTO specifico processo
+    tss_entry.esp0 = process_table[current_pid].stack_base + 4096;
+
+    // RIMAPPATURA DELLA MEMORIA VIRTUALE
+    if (current_pid > 0) {
+        // Colleghiamo l'indirizzo Virtuale alla Tabella PRIVATA dell'App
+        page_directory[256] = ((uint32_t)process_table[current_pid].page_table) | 0x07; 
+    } else {
+        // Se è il Kernel a girare, stacchiamo la memoria delle App
+        page_directory[256] = 0; 
+    }
+    // Flush TLB (Diciamo al processore di aggiornare la mappa della memoria)
+    asm volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax");
+}
+
+// L'Interrupt Handler Naked: Scambia fisicamente TUTTI i registri
+__attribute__((naked)) void isr32_timer() {
+    asm volatile(
+        "pushal \n"                // Salva i registri generali
+        "push %ds \n"              // Salva i segmenti dati
+        "push %es \n"
+        "push %fs \n"
+        "push %gs \n"
+        "mov %esp, current_esp \n" // Salva lo stato attuale
+        "call schedule \n"         // Cambia il processo
+        "mov current_esp, %esp \n" // Carica il nuovo stato
+        "mov $0x20, %al \n"
+        "out %al, $0x20 \n"        // Conferma al PIC
+        "pop %gs \n"               // Ripristina i segmenti!
+        "pop %fs \n"
+        "pop %es \n"
+        "pop %ds \n"
+        "popal \n"                 // Ripristina i registri generali
+        "iret \n"                  
+    );
+}
+
+
+
+
+// --- IL VERO GESTORE DELLE SYSCALL ---
+// Adesso riceve i parametri direttamente da Assembly
+void syscall_handler(uint32_t sys_id, uint32_t arg1, uint32_t arg2, uint32_t arg3) {
+
+    if (sys_id == 1) {
+        print_term((const char*)arg1);
+        // INVECE DI FORZARE IL DISEGNO, ALZIAMO SOLO LA BANDIERINA
+        // Sarà il ciclo main() a disegnare lo schermo quando ha tempo, fluidificando tutto
+        refresh_requested = 1; 
+    }
+    else if (sys_id == 2) {
+        for(int i=0; i<TERM_MAX_ROWS; i++) term_history[i][0] = '\0'; 
+        term_scroll = 0;
+        render_desktop(mouse_x, mouse_y, is_clicking);
+    }
+    else if (sys_id == 3) {
+        // Diciamo al Kernel di cosa abbiamo bisogno
+        process_table[current_pid].input_buffer = (char*)arg1;
+        process_table[current_pid].input_max = arg2;
+        process_table[current_pid].input_idx = 0;
+        process_table[current_pid].waiting_for_input = 1;
+        
+        print_term("> "); 
+        
+        // Diciamo alla CPU di ricominciare ad ascoltare il Timer e la tastiera
+        asm volatile("sti");
+        
+        // L'app si addormenta. Ora il Timer PUÒ interromperla per far scorrere il Multitasking
+        while(process_table[current_pid].waiting_for_input == 1) {
+            asm volatile("pause"); 
+        }
+    }
+    else if (sys_id == 4) {
+        process_table[current_pid].is_critical_io = 1; // ALZIAMO LO SCUDO
+        // CODA DI ATTESA: Se il disco è bloccato (es. copia in corso), riaccendi
+        // gli interrupt, aspetta un millisecondo e ritenta (Spinlock con Yield)
+        while (vfs_lock == 1) {
+            asm volatile("sti \n pause \n cli"); 
+        }
+        uint32_t file_size = arg3;
+        vfs_lock = 1; // Chiudiamo a nostra volta il lucchetto
+
+        // Passiamo il file_size alla funzione del file system
+        if (ext2_write_file((const char*)arg1, (const char*)arg2, file_size)) {
+            print_term("API: File salvato su disco!");
+        } else {
+            print_term("API: ERRORE! Impossibile salvare il file.");
+        }
+        vfs_lock = 0; // Apriamo il lucchetto
+        process_table[current_pid].is_critical_io = 0; // ABBASSIAMO LO SCUDO
+        render_desktop(mouse_x, mouse_y, is_clicking);
+    }
+
+    // ========================================================
+    // SYSCALL 5: LETTURA EVENTI MOUSE (Multi-Window Aware)
+    // ========================================================
+    else if (sys_id == 5) {
+        mouse_state_t* app_mouse = (mouse_state_t*)arg1;
+
+        if (current_pid > 0) {
+            int top_win = window_order[0];
+            
+            // Controlliamo se la finestra in cima APPARTIENE a questa App
+            if (windows[top_win].active && windows[top_win].owner_pid == current_pid && windows[top_win].type == WIN_TYPE_APP_GUI) {
+                
+                // === FIX: IL RITORNO DELLO ZERO MAGICO ===
+                // Se la finestra colpita è la madre, la mascheriamo come '0' per l'SDK in Ring 3!
+                if (top_win == process_table[current_pid].linked_window) {
+                    app_mouse->win_id = 0;
+                } else {
+                    app_mouse->win_id = top_win; // Per i pop-up usiamo il vero ID
+                }
+                
+                app_mouse->clicked = is_clicking;
+                
+                app_mouse->x = mouse_x - (windows[top_win].x + 4);
+                app_mouse->y = mouse_y - (windows[top_win].y + 30);
+                
+                // Clic fuori dal canvas (es. barra del titolo)? Ignoriamo per l'App
+                if (app_mouse->x < 0 || app_mouse->y < 0 || 
+                    app_mouse->x > (windows[top_win].w - 8) || app_mouse->y > (windows[top_win].h - 34)) {
+                    app_mouse->clicked = 0; 
+                }
+            } else {
+                app_mouse->clicked = 0;
+                app_mouse->win_id = -1; // Nessuna nostra finestra a fuoco
+            }
+        }
+    }
+    // ========================================================
+    // SYSCALL 6: YIELD (Attesa Eventi GUI)
+    // ========================================================
+    else if (sys_id == 6) {
+        process_table[current_pid].waiting_for_input = 2; // 2 = Sospeso fino a evento Mouse!
+        asm volatile("sti");
+        while(process_table[current_pid].waiting_for_input == 2) {
+            asm volatile("pause"); 
+        }
+    }
+
+    // ========================================================
+    // SYSCALL 7: DISEGNO INTERFACCIA (Retained Mode)
+    // ========================================================
+    else if (sys_id == 7) {
+        gui_element_t* app_gui = (gui_element_t*)arg1;
+        int target_win_id = (int)arg2; // ORA LE APP POSSONO SCEGLIERE LA TELA!
+        
+        if (current_pid > 0) {
+            int win_id = target_win_id;
+            // Se l'app usa le vecchie funzioni (arg2 == 0 o -1), usiamo la finestra madre
+            if (win_id <= 0) win_id = process_table[current_pid].linked_window;
+            
+            // VERIFICA SICUREZZA: L'app possiede davvero questa finestra?
+            if (win_id >= 0 && win_id < MAX_WINDOWS && windows[win_id].owner_pid == current_pid) {
+                if (app_gui->type == 0) {
+                    windows[win_id].ui_count = 0; // Se Type 0, svuotiamo la tela
+                    
+                    // L'app ha iniziato a disegnare: rendiamo visibile la finestra!
+                    windows[win_id].is_initializing = 0; 
+
+                    // Reset dei limiti alla dimensione di base configurata dall'applicazione
+                    windows[win_id].min_w = windows[win_id].base_w; 
+                    windows[win_id].min_h = windows[win_id].base_h;
+                }  
+                else if (windows[win_id].ui_count < 32) {
+                    
+                    // --- DECODIFICA DEI FLAG ---
+                    int incoming_type = app_gui->type;
+                    int base_type = incoming_type & 0xFF;  // Mantiene solo il tipo base (0-5)
+                    int ignore_w = incoming_type & 0x0100; // Flag: Evita espansione X
+                    int ignore_h = incoming_type & 0x0200; // Flag: Evita espansione Y
+
+                    gui_element_t* dest = &windows[win_id].ui_elements[windows[win_id].ui_count];
+                    
+                    // FIX GRASSETTO: Preserviamo il bit 0x0400 (Bold) insieme al tipo base
+                    dest->type = base_type | (incoming_type & 0x0400); 
+                    
+                    dest->x = app_gui->x; dest->y = app_gui->y;
+                    dest->w = app_gui->w; dest->h = app_gui->h;
+                    dest->color1 = app_gui->color1; 
+                    dest->color2 = app_gui->color2; 
+                    
+                    if (base_type == 5) {
+                        dest->color1 = app_gui->color1;
+                    }
+
+                    int t = 0; while(app_gui->text[t] != '\0' && t < 255) { dest->text[t] = app_gui->text[t]; t++; }
+                    dest->text[t] = '\0';
+                    windows[win_id].ui_count++;
+
+                    // ===================================================
+                    // IL CUORE DEL CONTENT-AWARE WINDOW SIZING
+                    // ===================================================
+                    int el_w = dest->w;
+                    int el_h = dest->h;
+                    
+                    if (dest->type == 3) {
+                        el_w = get_prop_string_width(dest->text);
+                        el_h = 16;
+                    }
+                    
+                    int req_w = dest->x + el_w + 24; 
+                    int req_h = dest->y + el_h + 40;
+                    
+                    // 1. LA LARGHEZZA: Espandiamo SOLO se NON c'è il flag e non è Testo
+                    if (!ignore_w && dest->type != 3) {
+                        if (req_w > windows[win_id].min_w) windows[win_id].min_w = req_w;
+                    }
+                    
+                    // 2. L'ALTEZZA: Espandiamo SOLO se NON c'è il flag
+                    if (!ignore_h) {
+                        if (req_h > windows[win_id].min_h) windows[win_id].min_h = req_h;
+                    }
+                    
+                    // 3. Applichiamo l'espansione visiva
+                    if (windows[win_id].w < windows[win_id].min_w) windows[win_id].w = windows[win_id].min_w;
+                    if (windows[win_id].h < windows[win_id].min_h) windows[win_id].h = windows[win_id].min_h;
+                }
+                refresh_requested = 1; 
+            }
+        }
+    }
+
+    // ========================================================
+    // SYSCALL 8: LETTURA TASTIERA (Real-time)
+    // ========================================================
+    else if (sys_id == 8) {
+        char* key_dest = (char*)arg1;
+
+        // LA PATCH ANTI-FANTASMA: Ricevi il tasto SOLO se sei la finestra in primo piano
+        // ECCEZIONE: Se sei al secondo posto (window_order[1]) ma sopra di te c'è il Menu Start,
+        // sei comunque l'App attiva e ricevi la digitazione
+        int is_top = 0;
+        if (current_pid > 0) {
+            int win_id = process_table[current_pid].linked_window;
+            if (global_active_win == win_id) { // Usa il nuovo focus
+                is_top = 1;
+            } else if (global_active_win != -1 && windows[global_active_win].type == WIN_TYPE_START_MENU && window_order[1] == win_id) {
+                is_top = 1; // Eccezione per il menu start aperto
+            }
+        }
+
+        if (is_top) {
+            *key_dest = last_key_pressed;
+            last_key_pressed = 0; // Svuotiamo la buca delle lettere dopo averla letta
+        } else {
+            *key_dest = 0; // Se sei in background, il Kernel ti ignora e restituisce "nessun tasto" (0).
+        }
+    }
+
+    // ========================================================
+    // SYSCALL 9: INFO DIMENSIONI FINESTRA (Context-Aware)
+    // ========================================================
+    else if (sys_id == 9) {
+        int* w_dest = (int*)arg1;
+        int* h_dest = (int*)arg2;
+        int target_win_id = (int)arg3; // Leggiamo il contesto dal registro EDX
+
+        if (current_pid > 0) {
+            int win_id = target_win_id;
+            if (win_id <= 0) win_id = process_table[current_pid].linked_window;
+            
+            if (win_id >= 0 && win_id < MAX_WINDOWS && windows[win_id].owner_pid == current_pid) {
+                *w_dest = windows[win_id].w; // Consegniamo la larghezza
+                *h_dest = windows[win_id].h; // Consegniamo l'altezza
+            }
+        }
+    }
+
+    // ========================================================
+    // SYSCALL 10: LETTURA FILE (Dal disco alla RAM App)
+    // ========================================================
+    else if (sys_id == 10) {
+        process_table[current_pid].is_critical_io = 1; // ALZIAMO LO SCUDO
+        // CODA DI ATTESA
+        while (vfs_lock == 1) {
+            asm volatile("sti \n pause \n cli"); 
+        }
+        uint32_t actual_size = 0;
+
+        vfs_lock = 1; // Chiudiamo a nostra volta il lucchetto
+
+        // Limite alzato a 300KB
+        int success = ext2_read_file((const char*)arg1, (char*)arg2, 300000, &actual_size);
+        
+        if (success) {
+            // Consegniamo il pacchetto con la grandezza esatta all'App
+            if (arg3 != 0) *((uint32_t*)arg3) = actual_size;
+        } else {
+            char* err_buf = (char*)arg2;
+            err_buf[0] = '\0';
+            if (arg3 != 0) *((uint32_t*)arg3) = 0; // CORRETTO: Usiamo arg3 direttamente
+        }
+        vfs_lock = 0; // Apriamo il lucchetto
+        process_table[current_pid].is_critical_io = 0; // ABBASSIAMO LO SCUDO
+    }
+
+    // ========================================================
+    // SYSCALL 11: LEGGI TESTO DA ELEMENTO GUI
+    // ========================================================
+    else if (sys_id == 11) {
+        int element_idx = arg1;
+        char* dest_buffer = (char*)arg2;
+        int target_win_id = (int)arg3; // NUOVO: Leggiamo l'ID della finestra
+
+        if (current_pid > 0) {
+            int win_id = target_win_id;
+            if (win_id <= 0) win_id = process_table[current_pid].linked_window;
+            
+            // Verifichiamo il proprietario e l'indice
+            if (win_id >= 0 && win_id < MAX_WINDOWS && windows[win_id].owner_pid == current_pid && element_idx >= 0 && element_idx < windows[win_id].ui_count) {
+                
+                // Peschiamo l'elemento grafico corretto dalla Display List
+                gui_element_t* el = &windows[win_id].ui_elements[element_idx];
+                
+                // Copiamo il testo (max 15 caratteri) nel buffer dell'app
+                int t = 0;
+                while (el->text[t] != '\0' && t < 255) {
+                    dest_buffer[t] = el->text[t];
+                    t++;
+                }
+                dest_buffer[t] = '\0'; // Chiudiamo sempre la stringa in modo sicuro
+                
+            } else {
+                // Errore: Indice non valido, restituiamo una stringa vuota per evitare crash
+                dest_buffer[0] = '\0';
+            }
+        }
+    }
+
+    // ========================================================
+    // SYSCALL 12: RIPRODUCI AUDIO WAA (48kHz Stereo)
+    // ========================================================
+    else if (sys_id == 12) {
+        char* audio_path = (char*)arg1;
+        
+        // Se c'è un driver audio registrato e attivo, passagli la stringa
+        if (sys_audio_play != 0) {
+            sys_audio_play(audio_path);
+        }
+    }
+
+    // ========================================================
+    // SYSCALL 13: EXIT (Suicidio volontario dell'App)
+    // ========================================================
+    else if (sys_id == 13) {
+        if (current_pid > 0) {
+            // Chiudiamo fisicamente TUTTE le finestre possedute dall'app
+            for(int w = 0; w < MAX_WINDOWS; w++) {
+                if (windows[w].active && windows[w].owner_pid == current_pid) {
+                    windows[w].active = 0;
+                }
+            }
+            refresh_requested = 1;
+            kill_process(); 
+        }
+    }
+    
+    // ========================================================
+    // SYSCALL 14: CREA FINESTRA FIGLIA (Multi-Window)
+    // ========================================================
+    else if (sys_id == 14) {
+        char* title = (char*)arg1;
+        // Spacchettiamo Larghezza e Altezza che l'App ci manderà compattati in un solo numero
+        int req_w = (arg2 & 0xFFFF);
+        int req_h = (arg2 >> 16) & 0xFFFF;
+        int* out_win_id = (int*)arg3;
+        
+        if (current_pid > 0) {
+            int parent_win = process_table[current_pid].linked_window;
+            int start_x = 100; int start_y = 100;
+            
+            if (parent_win >= 0 && windows[parent_win].active) {
+                start_x = windows[parent_win].x + 30; // Offset diagonale
+                start_y = windows[parent_win].y + 30;
+            }
+            
+            // Creiamo la finestra assegnandola al PROCESSO ATTUALE!
+            int new_win = open_window(WIN_TYPE_APP_GUI, title, start_x, start_y, req_w, req_h, current_pid);
+            
+            // Consegniamo l'Handle (ID Finestra) all'app scrivendolo nel suo puntatore!
+            if (out_win_id != 0) *out_win_id = new_win; 
+            
+            refresh_requested = 1;
+        }
+    }
+    // ========================================================
+    // SYSCALL 15: STATUS FINESTRA (E' ancora viva?)
+    // ========================================================
+    else if (sys_id == 15) {
+        int win_id = (int)arg1;
+        int* is_active = (int*)arg2;
+        if (win_id >= 0 && win_id < MAX_WINDOWS && windows[win_id].owner_pid == current_pid) {
+            *is_active = windows[win_id].active;
+        } else {
+            *is_active = 0;
+        }
+    }
+
+    // ========================================================
+    // SYSCALL 16: IMPOSTA DIMENSIONE INIZIALE/BASE FINESTRA
+    // ========================================================
+    else if (sys_id == 16) {
+        int req_w = (int)arg1;
+        int req_h = (int)arg2;
+        int target_win_id = (int)arg3;
+        
+        if (current_pid > 0) {
+            int win_id = target_win_id;
+            if (win_id <= 0) win_id = process_table[current_pid].linked_window;
+            
+            if (win_id >= 0 && win_id < MAX_WINDOWS && windows[win_id].owner_pid == current_pid) {
+                windows[win_id].base_w = req_w;
+                windows[win_id].base_h = req_h;
+                windows[win_id].min_w = req_w;
+                windows[win_id].min_h = req_h;
+                windows[win_id].w = req_w;
+                windows[win_id].h = req_h;
+                
+                // Rende visibile la finestra se l'app imposta subito la dimensione
+                windows[win_id].is_initializing = 0; 
+                
+                // Ricalcoliamo istantaneamente la centratura
+                windows[win_id].x = (fb_width - req_w) / 2;
+                windows[win_id].y = (fb_height - 30 - req_h) / 2;
+                if (windows[win_id].x < 0) windows[win_id].x = 0;
+                if (windows[win_id].y < 0) windows[win_id].y = 0;
+            }
+            refresh_requested = 1;
+        }
+    }
+
+    else {
+        print_term("ERRORE: Syscall sconosciuta chiamata dall'App.");
+        render_desktop(mouse_x, mouse_y, is_clicking);
+    }
+    
+
+}
+// --- IL PORTIERE ASSEMBLY (Wrapper Syscall) ---
+// Questa funzione intercetta l'hardware, prepara gli argomenti (arg3, arg2, arg1, sys_id)
+// chiama il nostro codice C, e poi torna all'App chiudendo la porta in modo sicuro
+__attribute__((naked)) void isr128_syscall() {
+    asm volatile(
+        "push %edx \n"            // arg3 
+        "push %ecx \n"            // arg2
+        "push %ebx \n"            // arg1
+        "push %eax \n"            // sys_id
+        "call syscall_handler \n" 
+        "add $16, %esp \n"        // 4 parametri * 4 byte = Pulisce 16 byte
+        "iret \n"                 
+    );
+}
+
+
+// Compila una voce della rubrica
+void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
+    idt[num].base_low = (base & 0xFFFF);
+    idt[num].base_high = (base >> 16) & 0xFFFF;
+    idt[num].sel = sel;
+    idt[num].zero = 0;
+    idt[num].flags = flags;
+}
+
+// Inizializza la IDT
+void init_idt() {
+    idtp.limit = (sizeof(struct idt_entry) * 256) - 1;
+    idtp.base = (uint32_t)&idt;
+
+    uint16_t current_cs;
+    asm volatile("mov %%cs, %0" : "=r"(current_cs));
+
+    // 1. Azzeriamo tutti i 256 campanelli
+    for (int i = 0; i < 256; i++) {
+        idt_set_gate(i, 0, 0, 0);
+    }
+
+    // 2. Mappiamo le 32 Eccezioni Hardware sul nostro Kernel Panic Generico!
+    for (int i = 0; i < 32; i++) {
+        idt_set_gate(i, (uint32_t)isr_generic, current_cs, 0x8E);
+    }
+
+    // 3. Specializziamo le eccezioni più gravi coi nostri investigatori
+    idt_set_gate(0, (uint32_t)isr0_divzero, current_cs, 0x8E);
+    idt_set_gate(13, (uint32_t)isr13_gpf, current_cs, 0x8E);
+    idt_set_gate(14, (uint32_t)isr14_pfault, current_cs, 0x8E);
+
+    idt_set_gate(32, (uint32_t)isr32_timer, current_cs, 0x8E); // IL TIMER (IRQ0)
+
+    // Flags 0xEE significa: "Presente, Eseguibile anche dal Ring 3 (User Mode)"
+    idt_set_gate(128, (uint32_t)isr128_syscall, current_cs, 0xEE);
+
+    // 4. MAGIA: Carichiamo la rubrica nel cuore del processore x86
+    asm volatile("lidt %0" : : "m" (idtp));
+}
+
+// ==========================================
+// IL CUORE HARDWARE (PIC & PIT)
+// ==========================================
+
+// Riprogrammiamo il centralinista degli Interrupt (PIC)
+void init_pic() {
+    // 1. Inizializzazione (ICW1)
+    outb(0x20, 0x11); outb(0xA0, 0x11);
+    
+    // 2. Remapping (ICW2): Spostiamo gli interrupt hardware dal numero 32 in poi
+    // (Perché da 0 a 31 sono riservati per gli errori della CPU come il "Divided by Zero")
+    outb(0x21, 0x20); // Master PIC parte da 32 (0x20)
+    outb(0xA1, 0x28); // Slave PIC parte da 40 (0x28)
+    
+    // 3. Cascading (ICW3): Diciamo come sono collegati tra loro
+    outb(0x21, 0x04); outb(0xA1, 0x02);
+    
+    // 4. Modalità (ICW4): Modalità x86 standard
+    outb(0x21, 0x01); outb(0xA1, 0x01);
+    
+    // 5. MASCHERE (FONDAMENTALE): 
+    // Blocchiamo tutti gli interrupt hardware TRANNE il Timer (Bit 0 del Master).
+    // In questo modo tastiera e mouse continueranno a funzionare col nostro vecchio metodo!
+    outb(0x21, 0xFE); // 11111110 in binario (Zero = Abilitato)
+    outb(0xA1, 0xFF); // 11111111 (Tutti bloccati sullo Slave)
+}
+
+// Accendiamo il Metronomo (PIT)
+void init_pit(uint32_t frequency) {
+    // La frequenza base del chip è 1193180 Hz. La dividiamo per ottenere la nostra!
+    uint32_t divisor = 1193180 / frequency;
+    
+    // Inviamo il comando: Canale 0, Modalità "Onda Quadra"
+    outb(0x43, 0x36); 
+    
+    // Inviamo il divisore (prima la parte bassa, poi la parte alta)
+    outb(0x40, (uint8_t)(divisor & 0xFF));
+    outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
+}
+
+
+// ==========================================
+// MOTORE DEL TEMPO (SLEEP)
+// ==========================================
+void sleep(uint32_t ms) {
+    // Controlliamo se gli interrupt sono abilitati leggendo il registro EFLAGS della CPU
+    uint32_t eflags;
+    asm volatile("pushf \n pop %0" : "=r"(eflags));
+
+    if (eflags & 0x0200) { 
+        // GLI INTERRUPT SONO ACCESI! Usiamo l'orologio hardware esatto (PIT)
+        uint32_t ticks_to_wait = ms / 10; // 100 Hz = 1 tick ogni 10 ms
+        if (ticks_to_wait == 0) ticks_to_wait = 1;
+        uint32_t start_ticks = system_ticks;
+        
+        while (system_ticks - start_ticks < ticks_to_wait) {
+            // Manda a dormire la CPU fino al prossimo "tick" per non surriscaldare il PC!
+            asm volatile("hlt"); 
+        }
+    } else {
+        // GLI INTERRUPT SONO SPENTI: Fallback di emergenza
+        for(volatile uint32_t d = 0; d < (ms * 50000); d++);
+    }
+}
+
+// ==========================================
+// MOTORE GRAFICO FASE DI BOOT
+// ==========================================
+int boot_cursor_y = 20;
+
+// Stampa un messaggio bianco
+void print_boot(const char* msg) {
+    draw_string(msg, 10, boot_cursor_y, 0xFFFFFFFF, 1); // Scale 1 (Normale)
+    boot_cursor_y += 14;                                // Interlinea ridotta per Scale 1
+    swap_buffers(); 
+    
+    // RITARDO TRIPLICATO per una lettura umana
+    for(volatile int d = 0; d < 50000000; d++); 
+}
+
+// Stampa un successo [ OK ] in verde
+void print_boot_ok(const char* msg) {
+    draw_string("[ OK ]", 10, boot_cursor_y, 0xFF00FF00, 1); // Scale 1
+    draw_string(msg, 80, boot_cursor_y, 0xFFCCCCCC, 1);      // Scale 1
+    boot_cursor_y += 14;
+    swap_buffers();
+    
+    // RITARDO TRIPLICATO!
+    for(volatile int d = 0; d < 30000000; d++); 
+}
+
+// Stampa un errore [FAIL] in rosso
+void print_boot_err(const char* msg) {
+    draw_string("[FAIL]", 10, boot_cursor_y, 0xFFFF0000, 1); // Scale 1
+    draw_string(msg, 80, boot_cursor_y, 0xFFFF0000, 1);      // Scale 1
+    boot_cursor_y += 14;
+    swap_buffers();
+    
+    for(volatile int d = 0; d < 80000000; d++); 
+}
+
+// ==========================================
+// KERNEL (MAIN)
+// ==========================================
+
+void kernel_main(void) {
+    
+
+    // 1. Accendiamo SOLO la scheda video
+    init_graphics();
+    
+    // 2. Dipingiamo lo schermo di Azzurro per la Boot Screen Grafica
+    draw_bootscreen_background();
+    bootscreen_status("Avvio Ante-Millennium...");
+
+    // --- FASE 1: MEMORIA ---
+    init_paging();
+    init_heap();
+    init_dma_heap();
+    uint32_t detected_ram = detect_system_ram();
+    init_pfa(detected_ram);
+    bootscreen_status("Gestione Memoria e Paging... [OK]");
+
+    // --- FASE 2: CORE KERNEL ---
+    init_gdt();
+    init_idt();
+    bootscreen_status("Architettura x86 Protetta... [OK]");
+
+    // --- FASE 3: HARDWARE E CONTROLLER ---
+    mouse_init();
+    init_pic();
+    init_pit(100);
+
+    
+    // =======================================================
+    // ACCENSIONE PRECOCE DEL MOTORE DEL TEMPO
+    // Registriamo il Kernel nello Scheduler per evitare crash, 
+    // e accendiamo gli interrupt hardware fin da ora
+    // =======================================================
+    process_table[0].active = 1;
+    process_table[0].linked_window = -1;
+    asm volatile("sti"); 
+
+    
+    bootscreen_status("Inizializzazione Periferiche I/O... [OK]");
+
+    // --- FASE 4: DISCO FISSO E FILE SYSTEM ---
+    if (ata_identify()) {
+        bootscreen_status("Rilevamento disco fisso IDE/ATA... [OK]");
+
+        if (ext2_mount()) {
+            // IL FILE SYSTEM E' MONTATO! ORA POSSIAMO CARICARE IL LOGO
+            if (load_bootscreen_logo()) {
+                draw_bootscreen_background(); // Ridisegna lo sfondo ma con il logo al centro
+            }
+            bootscreen_status("Montaggio File System Ext2... [OK]");
+        } else {
+            bootscreen_status("ERRORE: Superblocco Ext2 non trovato!");
+        }
+    } else {
+        bootscreen_status("ERRORE: Nessun Disco ATA Primario rilevato!");
+    }
+
+
+    // Pausa di 2 secondi esatti
+    sleep(2000);
+    
+    bootscreen_status("Preparazione Interfaccia Grafica...");
+    
+    // 5 secondi esatti di attesa
+    sleep(5000);
+
+
+    // PULIZIA RAM KERNEL: Il logo ha fatto il suo lavoro, svuotiamolo per non intasare l'Heap
+    if (bootscreen_logo_raw) {
+        kfree(bootscreen_logo_raw);
+        bootscreen_logo_raw = 0;
+    }
+
+
+    // ORA SIAMO PRONTI A LANCIARE IL DESKTOP
+    init_window_manager();
+
+
+    // Prepariamo il "Dizionario" per i Moduli esterni
+    init_driver_api();
+
+    
+
+    // Calcoliamo la posizione iniziale del mouse ORA che il sistema è sveglio
+    mouse_x = fb_width / 2;
+    mouse_y = fb_height / 2;
+
+    render_desktop(mouse_x, mouse_y, is_clicking);
+
+    uint8_t mouse_cycle = 0;
+    int8_t mouse_byte[3];
+
+    // Inizializza lo storico del terminale vuoto
+    for(int i=0; i<TERM_MAX_ROWS; i++) term_history[i][0] = '\0';
+
+
+    print_term("Inizializzazione Sistema Operativo completata.");
+    // --- CHECK HARDWARE DISCO ALL'AVVIO ---
+    if (ata_identify()) {
+        char boot_msg[100];
+        int idx = 0;
+        
+        char* lbl = "HDA Rilevato: ";
+        while(*lbl) boot_msg[idx++] = *lbl++;
+        char* mod = ata_drive_model;
+        while(*mod) boot_msg[idx++] = *mod++;
+        char* lbl2 = " (";
+        while(*lbl2) boot_msg[idx++] = *lbl2++;
+        char num_mb[32]; itoa(ata_drive_capacity_mb, num_mb);
+        char* n = num_mb; while(*n) boot_msg[idx++] = *n++;
+        char* lbl3 = " MB)";
+        while(*lbl3) boot_msg[idx++] = *lbl3++;
+        boot_msg[idx] = '\0';
+        
+        print_term(boot_msg);
+
+        // ========================================================
+        // MOUNT DEL FILE SYSTEM EXT2 (IL NUOVO PASSO)
+        // ========================================================
+        if (ext2_mount()) {
+            char mount_msg[100];
+            idx = 0;
+            char* m_lbl1 = "Ext2 Montato: "; while(*m_lbl1) mount_msg[idx++] = *m_lbl1++;
+            char num_bg[32]; itoa(ext2_total_groups, num_bg);
+            char* n_bg = num_bg; while(*n_bg) mount_msg[idx++] = *n_bg++;
+            char* m_lbl2 = " Block Groups attivi."; while(*m_lbl2) mount_msg[idx++] = *m_lbl2++;
+            mount_msg[idx] = '\0';
+            print_term(mount_msg);
+        } else {
+            print_term("ERRORE CRITICO: Impossibile montare il file system Ext2!");
+        }
+
+    } else {
+        print_term("ATTENZIONE: Nessun Disco ATA Primario rilevato!");
+    }
+    // NUOVI NOMI DELLE VARIABILI PER NON ANDARE IN CONFLITTO CON IL BOOT
+    char term_ram_msg[64] = "RAM Fisica installata: ";
+    char term_ram_num[16]; itoa(detected_ram, term_ram_num);
+    int t_r_idx = 23; int t_rn = 0;
+    while(term_ram_num[t_rn]) term_ram_msg[t_r_idx++] = term_ram_num[t_rn++];
+    term_ram_msg[t_r_idx++] = ' '; term_ram_msg[t_r_idx++] = 'M'; term_ram_msg[t_r_idx++] = 'B'; term_ram_msg[t_r_idx] = '\0';
+    print_term(term_ram_msg);
+    /*
+    print_term("                                              ");
+    print_term("                                              ");
+    print_term("====     Ante-Millennium OS x86 v0.1      ====");
+    print_term("                                              ");
+    print_term("-    DISCLAIMER: versione sperimentale!      -");
+    print_term("                                              ");
+    print_term("--------- Canale YouTube 511break ------------");
+    print_term("                                              ");
+    print_term("Digita 'help' e premi Invio per la lista comandi.");
+    */
+    // AUTOMAZIONE AVVIO AUDIO
+    print_term("Caricamento demone audio AC97...");
+    load_driver("/system/drivers/ac97.drv");
+    
+    if (sys_audio_play != 0) {
+        sys_audio_play("/system/media/startup.wav");
+    } else {
+        print_term("ATTENZIONE: Driver audio non caricato.");
+    }
+    refresh_requested = 1;
+
+    int shift_pressed = 0; // 0 = Rilasciato, 1 = Premuto
+
+    
+    // Prima del ciclo, dichiariamo la memoria del tempo
+    uint8_t last_second = 0; 
+    uint32_t last_render_tick = 0; 
+    
+    while (1) {
+        // V-SYNC STRICT: 50 FPS massimi! (100 tick / 2)
+        if (refresh_requested && (system_ticks - last_render_tick >= 2 || anim_active)) {
+            refresh_requested = 0;
+            last_render_tick = system_ticks; 
+            render_desktop(mouse_x, mouse_y, is_clicking);
+        }
+        if (inb(0x64) & 1) { 
+            if (inb(0x64) & 0x20) { 
+                mouse_byte[mouse_cycle++] = inb(0x60);
+                
+                if (mouse_cycle == 3) {
+                    mouse_cycle = 0;
+                    
+                    prev_clicking = is_clicking;
+                    is_clicking = mouse_byte[0] & 0x01;
+                    
+                    mouse_x += mouse_byte[1];
+                    mouse_y -= mouse_byte[2];
+
+                    if (mouse_x < 0) mouse_x = 0;
+                    if (mouse_x >= fb_width) mouse_x = fb_width - 1;
+                    if (mouse_y < 0) mouse_y = 0;
+                    if (mouse_y >= fb_height) mouse_y = fb_height - 1;
+                    
+                    // =======================================================
+                    // IL RIDISEGNO FLUIDO DEL CURSORE
+                    // Se il mouse si muove o clicca, ridisegniamo il cursore!
+                    // Ora che abbiamo bloccato il risveglio multiplo delle app,
+                    // il motore grafico è abbastanza veloce da reggerlo a 100 FPS.
+                    // =======================================================
+                    if (mouse_byte[1] != 0 || mouse_byte[2] != 0 || is_clicking != prev_clicking) {
+                        refresh_requested = 1;
+                        
+                    }
+
+                    // =======================================================
+                    // OTTIMIZZAZIONE 2: LA SVEGLIA SPIETATA (MULTI-WINDOW)
+                    // =======================================================
+                    int active_win = window_order[0];
+                    for(int p=1; p<MAX_PROCESSES; p++) {
+                        if (process_table[p].active && process_table[p].waiting_for_input == 2) {
+                            // FIX 4: Se la finestra attiva APPARTIENE a questo processo, sveglialo
+                            if (windows[active_win].owner_pid == p) {
+                                process_table[p].waiting_for_input = 0; 
+                            }
+                        }
+                    }
+
+                    
+
+
+                   
+                    
+
+                    // --- LOGICA DI INTERAZIONE MOUSE (Z-Ordered) ---
+                    if (is_clicking == 1 && prev_clicking == 0) {
+                        
+                        // Calcolo dinamico della Y per le hitbox animate
+                        int tb_y = fb_height - 30 - taskbar_y_offset; 
+
+                        // DI DEFAULT TOGLIAMO IL FOCUS A TUTTI (Se il click cade nel vuoto resterà così)
+                        int old_tooltip = active_tooltip_window; // Salviamo la nuvoletta aperta prima di resettarla
+                        active_tooltip_window = -1;
+                        
+                        // SVUOTIAMO IL BUFFER TASTIERA AL CAMBIO DI FOCUS
+                        last_key_pressed = 0;
+
+                        // ========================================================================
+                        // HITBOX TASKBAR DINAMICA E CHIUSURA MENU
+                        // ========================================================================
+                        int tb_w = taskbar_w;
+                        int tb_x = (fb_width - tb_w) / 2;
+                        
+                        int clicked_on_menu = 0;
+                        // Il pulsante Start ora segue l'ancoraggio sinistro dinamico (tb_x + 7)
+                        int start_btn_x = tb_x + 7;
+                        int clicked_on_start_btn = (mouse_x >= start_btn_x && mouse_x <= start_btn_x + 80 && mouse_y >= tb_y && mouse_y <= tb_y + 26);
+
+                        // 1. Verifichiamo se il click è caduto dentro un menu aperto
+                        for (int m = 0; m < MAX_WINDOWS; m++) {
+                            if (windows[m].active && (windows[m].type == WIN_TYPE_START_MENU || windows[m].type == WIN_TYPE_APP_MENU)) {
+                                if (mouse_x >= windows[m].x && mouse_x <= windows[m].x + windows[m].w && 
+                                    mouse_y >= windows[m].y && mouse_y <= windows[m].y + windows[m].h) {
+                                    clicked_on_menu = 1; break;
+                                }
+                            }
+                        }
+
+                        // 2. Se clicco nel vuoto chiudi i menu
+                        if (!clicked_on_menu && !clicked_on_start_btn) {
+                            for (int m = 0; m < MAX_WINDOWS; m++) {
+                                if (windows[m].active && (windows[m].type == WIN_TYPE_START_MENU || windows[m].type == WIN_TYPE_APP_MENU)) {
+                                    windows[m].active = 0;
+                                    refresh_requested = 1;
+                                }
+                            }
+                        }
+
+                        if (clicked_on_start_btn) {
+                            int menu_open = -1;
+                            for(int m=0; m<MAX_WINDOWS; m++) {
+                                if(windows[m].active && windows[m].type == WIN_TYPE_START_MENU) menu_open = m;
+                            }
+
+                            if (menu_open != -1) {
+                                windows[menu_open].active = 0; 
+                                for(int m=0; m<MAX_WINDOWS; m++) if(windows[m].type == WIN_TYPE_APP_MENU) windows[m].active = 0; 
+                            } else {
+                                // Apriamo il menu Start perfettamente allineato alla X dinamica!
+                                open_window(WIN_TYPE_START_MENU, "", start_btn_x, tb_y - 190, 160, 190, 0);
+                            }
+                            refresh_requested = 1;
+                            continue; 
+                        }
+
+                        // ========================================================================
+                        // CLICK SULL'ICONA "INFO" (Ancorata a destra) - ARMA IL CLICK
+                        // ========================================================================
+                        int clock_x_hit = (tb_x + tb_w) - 33;
+                        int info_w_hit = 26;
+                        int info_x_hitbox = clock_x_hit - info_w_hit - 10; 
+                        
+                        if (mouse_x >= info_x_hitbox && mouse_x <= info_x_hitbox + info_w_hit && mouse_y >= tb_y && mouse_y <= tb_y + 26) {
+                            pressed_info_btn = 1; // Armiamo il bottone
+                            continue; 
+                        }
+                        
+                        // ========================================================================
+                        // CLICK SUI PULSANTI DELLE APP (Area centrale dinamica e Sincronizzata)
+                        // ========================================================================
+                        int tb_start_x_hit = start_btn_x + 88; // Inizio esatto: tb_x + 95
+                        
+                        // CORREZIONE BUG: Allineiamo la fine della hitbox al calcolo visivo del separatore integrale
+                        int tb_end_x_hit = (info_x_hitbox - 15) - 12; 
+                        
+                        if (mouse_y >= tb_y && mouse_y <= tb_y + 26 && mouse_x >= tb_start_x_hit && mouse_x <= tb_end_x_hit) {
+                            int valid_wins[MAX_WINDOWS];
+                            int valid_count = get_taskbar_windows(valid_wins);
+                            if (valid_count > 0) {
+                                int tb_area_w = tb_end_x_hit - tb_start_x_hit;
+                                
+                                // Usiamo la stessa soglia di tolleranza visiva (> 10)
+                                if (tb_area_w > 10) {
+                                    int btn_w = tb_area_w / valid_count;
+                                    if (btn_w > 160) btn_w = 160;
+                                    
+                                    // I bottoni sono cliccabili SOLO se sono visibili (stessa soglia grafica btn_w > 30)
+                                    if (btn_w > 30) {
+                                        int clicked_idx = (mouse_x - tb_start_x_hit) / btn_w;
+                                        
+                                        // Precisione Pixel-Perfect: calcoliamo in che punto del singolo slot è caduto il mouse.
+                                        // Poiché il bottone visivo è largo (btn_w - 4), escludiamo i 4px di gap a destra!
+                                        int local_click_x = (mouse_x - tb_start_x_hit) % btn_w;
+                                        
+                                        if (clicked_idx >= 0 && clicked_idx < valid_count && local_click_x <= (btn_w - 4)) {
+                                            int target_win = valid_wins[clicked_idx];
+                                            bring_to_front(target_win);
+                                            windows[target_win].is_minimized = 0;
+                                            global_active_win = target_win; 
+                                            
+                                            update_taskbar_state(); 
+                                            
+                                            for(int m=0; m<MAX_WINDOWS; m++) {
+                                                if (windows[m].active && (windows[m].type == WIN_TYPE_START_MENU || windows[m].type == WIN_TYPE_APP_MENU)) windows[m].active = 0;
+                                            }
+                                            refresh_requested = 1;
+                                            continue; 
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // SCUDO TASKBAR: Ferma i click diretti alle finestre sotto la barra (Scudo animato)
+                        if (mouse_y >= tb_y) {
+                            continue; 
+                        }
+                        // Controlliamo dall'alto verso il basso
+                        for (int order_idx = 0; order_idx < MAX_WINDOWS; order_idx++) {
+                            int i = window_order[order_idx];
+                            
+                            // Ignoriamo completamente le finestre ridotte a icona (Ghost Windows)
+                            if (windows[i].active && !windows[i].is_minimized) {
+                                // Il cursore si trova dentro il perimetro di questa finestra?
+                                if (mouse_x >= windows[i].x && mouse_x <= windows[i].x + windows[i].w && 
+                                    mouse_y >= windows[i].y && mouse_y <= windows[i].y + windows[i].h) {
+                                    bring_to_front(i); // Portala subito in primo piano
+                                    global_active_win = i; // RESTITUIAMO IL FOCUS
+
+                                    // =======================================================
+                                    // Il Menu Start non ha X, Barra Titolo e Ridimensionamento
+                                    // =======================================================
+                                    if (windows[i].type != WIN_TYPE_START_MENU && windows[i].type != WIN_TYPE_APP_MENU) {
+
+                                        // =======================================================
+                                        // CLICK SULL'ICONA (NUVOLA INFORMATIVA)
+                                        // =======================================================
+                                        int icon_x = windows[i].x + 6;
+                                        int icon_y = windows[i].y + 8;
+                                        if (mouse_x >= icon_x && mouse_x <= icon_x + 16 && mouse_y >= icon_y && mouse_y <= icon_y + 16) {
+                                            // Effetto Toggle (Accendi/Spegni al click ripetuto)
+                                            if (old_tooltip != i) active_tooltip_window = i; 
+                                            refresh_requested = 1;
+                                            break; // Assorbiamo il click!
+                                        }
+
+                                        // Pulsante X (Chiudi finestra) - ORA "ARMA" SOLO IL CLICK
+                                        int btn_x = windows[i].x + windows[i].w - 29;
+                                        int btn_y = windows[i].y + 6;
+                                        if (mouse_x >= btn_x && mouse_x <= btn_x + 23 && mouse_y >= btn_y && mouse_y <= btn_y + 19) {
+                                            pressed_window_id = i;
+                                            pressed_window_btn = 1; // 1 = Azione Chiusura
+                                            break; 
+                                        }
+
+                                        // Pulsante MAXIMIZE (+) - ORA "ARMA" SOLO IL CLICK
+                                        int max_x = windows[i].x + windows[i].w - 56;
+                                        int max_y = windows[i].y + 6;
+                                        if (mouse_x >= max_x && mouse_x <= max_x + 23 && mouse_y >= max_y && mouse_y <= max_y + 19) {
+                                            pressed_window_id = i;
+                                            pressed_window_btn = 2; // 2 = Azione Massimizza
+                                            break;
+                                        }
+
+                                        // PULSANTE MINIMIZZA - ORA "ARMA" SOLO IL CLICK
+                                        int min_x = windows[i].x + windows[i].w - 83;
+                                        int min_y = windows[i].y + 6;
+                                        if (mouse_x >= min_x && mouse_x <= min_x + 23 && mouse_y >= min_y && mouse_y <= min_y + 19) {
+                                            pressed_window_id = i;
+                                            pressed_window_btn = 3; // 3 = Azione Minimizza
+                                            break;
+                                        }
+
+
+                                        // Barra del Titolo (Trascinamento - BLOCCATO SE MASSIMIZZATA)
+                                        if (mouse_x >= windows[i].x + 4 && mouse_x <= windows[i].x + windows[i].w - 4 && 
+                                            mouse_y >= windows[i].y + 4 && mouse_y <= windows[i].y + 28 && !windows[i].is_maximized) {
+                                            dragged_window = i; 
+                                            drag_offset_x = mouse_x - windows[i].x;
+                                            drag_offset_y = mouse_y - windows[i].y;
+                                            break; 
+                                        }
+
+                                        // ANGOLO DI RIDIMENSIONAMENTO (BLOCCATO SE MASSIMIZZATA)
+                                        int res_x = windows[i].x + windows[i].w - 16;
+                                        int res_y = windows[i].y + windows[i].h - 16;
+                                        if (mouse_x >= res_x && mouse_x <= res_x + 16 && mouse_y >= res_y && mouse_y <= res_y + 16 && !windows[i].is_maximized) {
+                                            resizing_window = i;
+                                            break;
+                                        }
+
+
+
+                                    }
+
+
+                                    // Logiche Terminale (AGGIORNATE PER DRAG SCROLLBAR)
+                                    if (windows[i].type == WIN_TYPE_TERMINAL) {
+                                        // Ricalcoliamo le coordinate con i nuovi margini
+                                        int term_x = windows[i].x + 4;
+                                        int term_y = windows[i].y + 32;
+                                        int term_w = windows[i].w - 8;
+                                        int term_h = windows[i].h - 36;
+                                        
+                                        int sb_x = term_x + term_w - 20; 
+                                        int sb_y = term_y;  
+                                        int sb_h = term_h;                
+                                        
+                                        // A. CLICK SUL CURSORE DELLA SCROLLBAR (Inizia trascinamento)
+                                        if (windows[i].t_max_scrl > 0 && mouse_x >= sb_x && mouse_x <= sb_x + 20 && 
+                                            mouse_y >= windows[i].t_thumb_y && mouse_y <= windows[i].t_thumb_y + windows[i].t_thumb_h) {
+                                            scrolling_window = i;
+                                            scroll_drag_offset_y = mouse_y; // <-- Memorizziamo la Y esatta del mouse
+                                            scroll_start_val = windows[i].t_scroll; // <-- Memorizziamo lo scroll esatto
+                                            break;
+                                        }
+                                        // B. Scrollbar SU (Freccia in alto)
+                                        else if (mouse_x >= sb_x && mouse_x <= sb_x + 20 && mouse_y >= sb_y && mouse_y <= sb_y + 20) {
+                                            windows[i].t_scroll += 2; 
+                                        }
+                                        // C. Scrollbar GIU (Freccia in basso)
+                                        else if (mouse_x >= sb_x && mouse_x <= sb_x + 20 && mouse_y >= sb_y + sb_h - 20 && mouse_y <= sb_y + sb_h) {
+                                            windows[i].t_scroll -= 2;
+                                            if (windows[i].t_scroll < 0) windows[i].t_scroll = 0;
+                                        }
+                                        // D. Click sul binario vuoto (Effetto Page Up / Page Down)
+                                        else if (windows[i].t_max_scrl > 0 && mouse_x >= sb_x && mouse_x <= sb_x + 20 && 
+                                                 mouse_y > sb_y + 20 && mouse_y < sb_y + sb_h - 20) {
+                                            if (mouse_y < windows[i].t_thumb_y) windows[i].t_scroll += 10;
+                                            else windows[i].t_scroll -= 10;
+                                            if (windows[i].t_scroll < 0) windows[i].t_scroll = 0;
+                                            if (windows[i].t_scroll > windows[i].t_max_scrl) windows[i].t_scroll = windows[i].t_max_scrl;
+                                        }
+                                        // E. Click sulla riga di input testuale del terminale
+                                        else if (mouse_y >= (term_y + term_h - 40) && mouse_y <= (term_y + term_h - 10)) {
+                                            int max_input_chars = (term_w - 60) / 8;
+                                            int start_idx = 0;
+                                            if (windows[i].t_cursor >= max_input_chars) start_idx = windows[i].t_cursor - max_input_chars + 1;
+                                            
+                                            int click_x_rel = mouse_x - (term_x + 42); // 10px margine + 32px di "OS> "
+                                            if (click_x_rel >= 0) {
+                                                int clicked_pos = start_idx + ((click_x_rel + 4) / 8);
+                                                if (clicked_pos > windows[i].t_len) clicked_pos = windows[i].t_len;
+                                                windows[i].t_cursor = clicked_pos;
+                                                blink_counter = 0;
+                                                refresh_requested = 1;
+                                            }
+                                        }
+                                    }
+                                    
+                                    
+                                    
+                                    // Logiche Menu Start (Cosa succede se clicco una voce?)
+                                    if (windows[i].type == WIN_TYPE_START_MENU) {
+                                        int rel_y = mouse_y - windows[i].y;
+                                        if (mouse_x > windows[i].x + 30) { 
+                                            // Click su "Terminal" (Spostato da 40 a 70)
+                                            if (rel_y >= 40 && rel_y < 70) {
+                                                windows[i].active = 0;
+                                                for(int m=0; m<MAX_WINDOWS; m++) if(windows[m].type == WIN_TYPE_APP_MENU) windows[m].active = 0;
+                                                open_window(WIN_TYPE_TERMINAL, "Ante-M OS x86", 150, 100, 500, 400,0);
+                                                print_term("Nuova sessione Terminale avviata.");
+                                                refresh_requested = 1;
+                                            }
+                                            // Click su "Applications" (Spostato da 70 a 100)
+                                            else if (rel_y >= 70 && rel_y <= 100) {
+                                                // 1. Chiudiamo sottomenu vecchi
+                                                for(int m=0; m<MAX_WINDOWS; m++) if(windows[m].type == WIN_TYPE_APP_MENU) windows[m].active = 0;
+                                                
+                                                // 2. Apriamo il nuovo menu ESATTAMENTE ATTACCATO A DESTRA
+                                                int sub_id = open_window(WIN_TYPE_APP_MENU, "", windows[i].x + windows[i].w, windows[i].y, 200, 190,0);
+                                                
+                                                if (sub_id != -1) {
+                                                    windows[sub_id].t_len = 0; // Usiamo t_len per contare le app
+                                                    uint8_t sector_buffer[1024] = {0};
+
+                                                    // 3. LETTURA DISCO ALLA RICERCA DEGLI .EDXI NELLA CARTELLA /apps
+                                                    uint32_t apps_inode_num = ext2_resolve_path("/apps");
+                                                    if (apps_inode_num > 0) {
+                                                        ext2_inode_t apps_inode = ext2_get_inode_struct(apps_inode_num);
+                                                        if ((apps_inode.i_mode & 0xF000) == 0x4000) { // È davvero una cartella?
+                                                            
+                                                            
+                                                            // Leggiamo i dati della directory /apps
+                                                            if (ata_read_sector(apps_inode.i_block[0] * 2, sector_buffer) && 
+                                                                ata_read_sector((apps_inode.i_block[0] * 2) + 1, sector_buffer + 512)) {
+                                                                
+                                                                uint32_t offset = 0;
+                                                                while (offset < 1024) { 
+                                                                    ext2_dir_entry_t entry; uint8_t* edst = (uint8_t*)&entry;
+                                                                    for(size_t j = 0; j < sizeof(ext2_dir_entry_t); j++) edst[j] = sector_buffer[offset + j];
+                                                                    if (entry.inode == 0 || entry.rec_len == 0) break;
+
+                                                                    char filename[256];
+                                                                    for (int k = 0; k < entry.name_len; k++) filename[k] = sector_buffer[offset + 8 + k];
+                                                                    
+                                                                    // Filtriamo solo i file .edxi
+                                                                    int len = entry.name_len;
+                                                                    if (len >= 5 && filename[len-5] == '.' && filename[len-4] == 'e' && filename[len-3] == 'd' && filename[len-2] == 'x' && filename[len-1] == 'i') {
+                                                                        filename[len-5] = '\0';
+                                                                        int f=0;
+                                                                        while(filename[f] && f < 149) {
+                                                                            windows[sub_id].t_history[windows[sub_id].t_len][f] = filename[f];
+                                                                            f++;
+                                                                        }
+                                                                        windows[sub_id].t_history[windows[sub_id].t_len][f] = '\0';
+                                                                        windows[sub_id].t_len++;
+                                                                        if (windows[sub_id].t_len >= TERM_MAX_ROWS) break; 
+                                                                    }
+                                                                    offset += entry.rec_len;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // 4. ORDINAMENTO ALFABETICO (Bubble Sort Integrato e Formattato)
+                                                    int count = windows[sub_id].t_len;
+                                                    for (int m = 0; m < count - 1; m++) {
+                                                        for (int n = 0; n < count - m - 1; n++) {
+                                                            int cmp = 0; int c = 0;
+                                                            while(windows[sub_id].t_history[n][c] && windows[sub_id].t_history[n+1][c]) {
+                                                                if (windows[sub_id].t_history[n][c] > windows[sub_id].t_history[n+1][c]) { cmp = 1; break; }
+                                                                if (windows[sub_id].t_history[n][c] < windows[sub_id].t_history[n+1][c]) { cmp = -1; break; }
+                                                                c++;
+                                                            }
+                                                            if (cmp == 0 && windows[sub_id].t_history[n][c] != '\0' && windows[sub_id].t_history[n+1][c] == '\0') cmp = 1;
+
+                                                            if (cmp > 0) { // Scambio testuale
+                                                                char temp[150]; 
+                                                                int k = 0;
+                                                                
+                                                                while((temp[k] = windows[sub_id].t_history[n][k]) != '\0') {
+                                                                    k++;
+                                                                }
+                                                                temp[k] = '\0';
+                                                                
+                                                                k = 0; 
+                                                                while((windows[sub_id].t_history[n][k] = windows[sub_id].t_history[n+1][k]) != '\0') {
+                                                                    k++;
+                                                                }
+                                                                windows[sub_id].t_history[n][k] = '\0';
+                                                                
+                                                                k = 0; 
+                                                                while((windows[sub_id].t_history[n+1][k] = temp[k]) != '\0') {
+                                                                    k++;
+                                                                }
+                                                                windows[sub_id].t_history[n+1][k] = '\0';
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                refresh_requested = 1;
+                                            }
+                                        }
+                                    }
+
+                                    // 6. Logiche Click sul Nuovo Sottomenu (LANCIO APPLICAZIONI)
+                                    else if (windows[i].type == WIN_TYPE_APP_MENU) {
+                                        int list_start_y = windows[i].y + 34;
+                                        // Aggiorniamo la matematica della zona cliccabile!
+                                        int sb_x = windows[i].x + windows[i].w - 22; 
+                                        int item_height = 22;
+                                        int visible_items = (windows[i].h - 38) / item_height;
+                                        int max_scrl = windows[i].t_len - visible_items;
+                                        if (max_scrl < 0) max_scrl = 0;
+
+                                        // A. Click sulla Scrollbar (La sua area attiva ora è larga 18)
+                                        if (mouse_x >= sb_x && mouse_x <= sb_x + 18 && mouse_y >= list_start_y) {
+                                            if (mouse_y < list_start_y + ((windows[i].h - 38) / 2)) windows[i].t_scroll -= 3;
+                                            else windows[i].t_scroll += 3;
+                                            if (windows[i].t_scroll < 0) windows[i].t_scroll = 0;
+                                            if (windows[i].t_scroll > max_scrl) windows[i].t_scroll = max_scrl;
+                                            refresh_requested = 1;
+                                        } 
+                                        // B. Click su un'app
+                                        else if (mouse_y >= list_start_y) {
+                                            int clicked_idx = (mouse_y - list_start_y) / item_height;
+                                            int actual_idx = windows[i].t_scroll + clicked_idx;
+
+                                            if (actual_idx < windows[i].t_len) {
+                                                // 1. Ricostruiamo la stringa puntando alla cartella "/apps/"
+                                                char target_file[64];
+                                                int f = 0;
+                                                char* prefix = "/apps/";
+                                                while(prefix[f] != '\0') { target_file[f] = prefix[f]; f++; }
+                                                
+                                                int name_idx = 0;
+                                                while(windows[i].t_history[actual_idx][name_idx] && f < 58) {
+                                                    target_file[f++] = windows[i].t_history[actual_idx][name_idx++];
+                                                }
+                                                target_file[f++] = '.'; target_file[f++] = 'e'; target_file[f++] = 'd'; target_file[f++] = 'x'; target_file[f++] = 'i';
+                                                target_file[f] = '\0';
+
+                                                // 2. Chiudiamo sia il Sottomenu che il Menu Start
+                                                windows[i].active = 0;
+                                                for(int m=0; m<MAX_WINDOWS; m++) if (windows[m].type == WIN_TYPE_START_MENU) windows[m].active = 0;
+
+                                                
+
+                                                // 3. IL LANCIO DELL'APP (Ora con Demand Paging)
+                                                uint32_t* app_pt = (uint32_t*)kmalloc(4096);
+
+                                                if (app_pt) {
+                                                    // Puliamo la tabella
+                                                    for(int k=0; k<1024; k++) app_pt[k] = 0;
+
+                                                    uint32_t actual_size = 0;
+                                                    void* temp_buffer = kmalloc(500000); // Buffer temporaneo per leggere il file
+                                                    
+                                                    if (temp_buffer && ext2_read_file(target_file, (char*)temp_buffer, 500000, &actual_size)) {
+                                                        
+                                                        // Quanti frame servono per l'eseguibile?
+                                                        uint32_t frames_needed = (actual_size / 4096) + 1;
+                                                        
+                                                        // Allochiamo i frame fisici
+                                                        for(uint32_t f = 0; f < frames_needed; f++) {
+                                                            uint32_t phys_frame = pfa_alloc_frame();
+                                                            app_pt[f] = phys_frame | 0x07; 
+                                                            
+                                                            uint8_t* dest = (uint8_t*)phys_frame; 
+                                                            uint8_t* src = (uint8_t*)temp_buffer + (f * 4096);
+                                                            for(int b = 0; b < 4096; b++) {
+                                                                if ((f * 4096 + b) < actual_size) {
+                                                                    dest[b] = src[b];
+                                                                } else {
+                                                                    dest[b] = 0; // AZZERIAMO LA CODA DEL FRAME
+                                                                }
+                                                            }
+                                                        }
+                                                        
+                                                        kfree(temp_buffer); // Finito, liberiamo la RAM temporanea del Kernel
+
+                                                        uint8_t* mem_ptr = (uint8_t*)(app_pt[0] & 0xFFFFF000); 
+
+                                                        int is_gui = 0;
+                                                        int is_virtual = 0; 
+                                                        uint32_t entry_offset = 0;
+                                                        
+                                                        // Controllo Header EDXI
+                                                        if (mem_ptr[0] == 'E' && mem_ptr[1] == 'D' && mem_ptr[2] == 'X' && mem_ptr[3] == 'I') {
+                                                            if (mem_ptr[4] == 1) is_gui = 1;
+                                                            if (mem_ptr[5] == 1) is_virtual = 1; 
+                                                            entry_offset = 16; 
+                                                        } else {
+                                                            print_term("ERRORE: File .edxi corrotto.");
+                                                            for(uint32_t f = 0; f < frames_needed; f++) pfa_free_frame(app_pt[f] & 0xFFFFF000);
+                                                            kfree(app_pt);
+                                                            continue; 
+                                                        }
+                                                        
+                                                        if (!is_virtual) {
+                                                            print_term("SICUREZZA: App obsoleta (Ring 0). Esecuzione bloccata!");
+                                                            for(uint32_t f = 0; f < frames_needed; f++) pfa_free_frame(app_pt[f] & 0xFFFFF000);
+                                                            kfree(app_pt);
+                                                            continue;
+                                                        }
+                                                        
+                                                        // Offset fisso Virtuale
+                                                        void (*app_func)(void) = (void (*)(void))(0x40000000 + entry_offset);
+                                                        
+                                                        int new_pid = get_free_pid();
+                                                        if (new_pid != -1) {
+                                                            if (is_gui) {
+                                                                int app_win_id = open_window(WIN_TYPE_APP_GUI, target_file, 150, 150, 400, 300, new_pid);
+                                                                // FIX: Le app lanciate dal Menu non hanno finestre genitore! (ID = -1)
+                                                                create_process(app_func, app_win_id, app_pt, is_virtual, -1, new_pid); 
+                                                            } else {
+                                                                int app_win_id = open_window(WIN_TYPE_TERMINAL, target_file, 200, 200, 500, 400, new_pid);
+                                                                create_process(app_func, app_win_id, app_pt, is_virtual, -1, new_pid);
+                                                            }
+                                                        } else {
+                                                            print_term("ERRORE: Raggiunto il limite massimo di processi attivi.");
+                                                            for(uint32_t f = 0; f < frames_needed; f++) pfa_free_frame(app_pt[f] & 0xFFFFF000);
+                                                            kfree(app_pt);
+                                                        }
+                                                    } else {
+                                                        print_term("Errore: Impossibile leggere il file.");
+                                                        if (temp_buffer) kfree(temp_buffer);
+                                                        kfree(app_pt);
+                                                    }
+                                                } else {
+                                                    print_term("Errore: Impossibile creare la Page Table!");
+                                                }
+
+
+                                                
+                                                refresh_requested = 1;
+                                            }
+                                        }
+                                    }
+                                    // =======================================================
+                                    // 7. Logiche App GUI (Focus sulle Textbox)
+                                    // =======================================================
+                                    else if (windows[i].type == WIN_TYPE_APP_GUI) {
+                                        int app_x = windows[i].x + 4;
+                                        int app_y = windows[i].y + 30; 
+                                        int clicked_on_textbox = 0;
+                                        
+                                        // Scansioniamo tutti gli elementi grafici dell'app per vedere se abbiamo colpito una Textbox
+                                        for(int e = 0; e < windows[i].ui_count; e++) {
+                                            gui_element_t* el = &windows[i].ui_elements[e];
+                                            if (el->type == 4) { 
+                                                int ex = app_x + el->x;
+                                                int ey = app_y + el->y;
+                                                
+
+                                                // Abbiamo cliccato questa Textbox
+                                                if (mouse_x >= ex && mouse_x <= ex + el->w && mouse_y >= ey && mouse_y <= ey + el->h) {
+                                                    focused_window_id = i;
+                                                    focused_element_idx = e;
+                                                    clicked_on_textbox = 1;
+                                                            
+                                                    // =======================================================
+                                                    // CALCOLO CLICK PROPORZIONALE (Con Scroll-Awareness)
+                                                    // =======================================================
+                                                    int t_len = 0; while(el->text[t_len] != '\0') t_len++;
+                                                    
+                                                    // Ricalcoliamo lo scroll per capire DOVE ESATTAMENTE abbiamo cliccato
+                                                    int temp_cursor_offset = 0;
+                                                    for (int k = 0; k < focused_cursor_pos && el->text[k] != '\0'; k++) {
+                                                        unsigned char uc = (unsigned char)el->text[k];
+                                                        if (uc < 128) {
+                                                            if (uc == ' ') temp_cursor_offset += 5;
+                                                            else temp_cursor_offset += font_prop[uc].width + 1;
+                                                        } else temp_cursor_offset += 8;
+                                                    }
+                                                    
+                                                    int text_area_w = el->w - 8;
+                                                    int scroll_x = 0;
+                                                    if (temp_cursor_offset > text_area_w - 12) {
+                                                        scroll_x = temp_cursor_offset - (text_area_w - 12);
+                                                    }
+
+                                                    // AGGIUNGIAMO LO SCROLL ALLA X RELATIVA DEL MOUSE
+                                                    int click_x_rel = mouse_x - (ex + 4) + scroll_x;
+                                                    int current_x = 0;
+                                                    int click_pos = 0;
+                                                            
+                                                    for (int k = 0; k < t_len; k++) {
+                                                        unsigned char uc = (unsigned char)el->text[k];
+                                                        int char_w = 8;
+                                                        if (uc < 128) {
+                                                            if (uc == ' ') char_w = 5;
+                                                            else char_w = font_prop[uc].width + 1;
+                                                        }
+                                                                
+                                                        if (click_x_rel < current_x + (char_w / 2)) break; 
+                                                                
+                                                        current_x += char_w;
+                                                        click_pos++;
+                                                    }
+                                                            
+                                                    focused_cursor_pos = click_pos;
+                                                    blink_counter = 0; 
+                                                            
+                                                    refresh_requested = 1;
+                                                    break;
+                                                }
+
+                                            }
+                                        }
+                                        
+                                        // Se clicchiamo sulla finestra, ma NON su una textbox, perdiamo il Focus
+                                        if (!clicked_on_textbox && focused_window_id == i) {
+                                            focused_window_id = -1;
+                                            focused_element_idx = -1;
+                                            refresh_requested = 1;
+                                        }
+                                    }
+                                    break; // FONDAMENTALE: Abbiamo cliccato la finestra in cima, ignoriamo le altre
+                                }
+                            }
+                        }
+                    }
+
+                    // Se rilasciamo il click, resettiamo tutto
+                    // =======================================================
+                    // FASE DI RILASCIO: ESEGUIAMO L'AZIONE SE SIAMO ANCORA SUL BOTTONE
+                    // =======================================================
+                    if (is_clicking == 0 && prev_clicking == 1) {
+                                                // ========================================================================
+                        // RILASCIO SUL PULSANTE "INFO" (Apertura App)
+                        // ========================================================================
+                        int tb_y_rel = fb_height - 30 - taskbar_y_offset; 
+                        int tb_w_rel = taskbar_w;
+                        int tb_x_rel = (fb_width - tb_w_rel) / 2;
+                        int clock_x_hit_rel = (tb_x_rel + tb_w_rel) - 33;
+                        int info_w_hit_rel = 26;
+                        int info_x_hitbox_rel = clock_x_hit_rel - info_w_hit_rel - 10; 
+                        
+                        // Apriamo l'app SOLO se avevamo premuto lì E stiamo rilasciando lì
+                        if (pressed_info_btn && mouse_x >= info_x_hitbox_rel && mouse_x <= info_x_hitbox_rel + info_w_hit_rel && mouse_y >= tb_y_rel && mouse_y <= tb_y_rel + 26) {
+                            char target_file[] = "/system/sys_apps/info.edxi";
+                            uint32_t actual_size = 0;
+                            if (ext2_read_file(target_file, NULL, 0, &actual_size) && actual_size > 0) {
+                                uint32_t* app_pt = (uint32_t*)kmalloc(4096);
+                                if (app_pt) {
+                                    for(int k=0; k<1024; k++) app_pt[k] = 0;
+                                    void* temp_buffer = kmalloc(500000); 
+                                    if (temp_buffer && ext2_read_file(target_file, (char*)temp_buffer, 500000, &actual_size)) {
+                                        uint32_t frames_needed = (actual_size / 4096) + 1;
+                                        for(uint32_t f = 0; f < frames_needed; f++) {
+                                            uint32_t phys_frame = pfa_alloc_frame();
+                                            app_pt[f] = phys_frame | 0x07; 
+                                            uint8_t* dest = (uint8_t*)phys_frame; 
+                                            uint8_t* src = (uint8_t*)temp_buffer + (f * 4096);
+                                            for(int b = 0; b < 4096; b++) {
+                                                if ((f * 4096 + b) < actual_size) dest[b] = src[b];
+                                                else dest[b] = 0;
+                                            }
+                                        }
+                                        kfree(temp_buffer);
+                                        uint8_t* mem_ptr = (uint8_t*)(app_pt[0] & 0xFFFFF000); 
+                                        if (mem_ptr[0] == 'E' && mem_ptr[1] == 'D' && mem_ptr[2] == 'X' && mem_ptr[3] == 'I' && mem_ptr[5] == 1) {
+                                            int is_gui = (mem_ptr[4] == 1);
+                                            void (*app_func)(void) = (void (*)(void))(0x40000000 + 16);
+                                            int new_pid = get_free_pid();
+                                            if (new_pid != -1) {
+                                                int app_win_id = open_window(is_gui ? WIN_TYPE_APP_GUI : WIN_TYPE_TERMINAL, target_file, 250, 200, 250, 180, new_pid);
+                                                create_process(app_func, app_win_id, app_pt, 1, -1, new_pid);
+                                                refresh_requested = 1;
+                                            } else {
+                                                for(uint32_t f = 0; f < frames_needed; f++) pfa_free_frame(app_pt[f] & 0xFFFFF000);
+                                                kfree(app_pt);
+                                            }
+                                        } else {
+                                            for(uint32_t f = 0; f < frames_needed; f++) pfa_free_frame(app_pt[f] & 0xFFFFF000);
+                                            kfree(app_pt);
+                                        }
+                                    } else {
+                                        if (temp_buffer) kfree(temp_buffer);
+                                        kfree(app_pt);
+                                    }
+                                }
+                            }
+                        }
+                        if (pressed_window_id != -1 && windows[pressed_window_id].active) {
+                            
+
+                            int i = pressed_window_id;
+                            int btn_x = windows[i].x + windows[i].w - 29;
+                            int btn_y = windows[i].y + 6;
+                            int max_x = windows[i].x + windows[i].w - 56;
+                            int max_y = windows[i].y + 6;
+                            int min_x = windows[i].x + windows[i].w - 83;
+                            int min_y = windows[i].y + 6;
+
+                            // A. Rilascio sul bottone CHIUDI
+                            if (pressed_window_btn == 1 && mouse_x >= btn_x && mouse_x <= btn_x + 23 && mouse_y >= btn_y && mouse_y <= btn_y + 19) {
+                                
+                                // === VERIFICA DELLO SCUDO I/O (Uninterruptible Sleep) ===
+                                int can_close = 1;
+                                for(int p = 1; p < MAX_PROCESSES; p++) {
+                                    // Se un processo collegato a questa finestra sta usando il disco...
+                                    if (process_table[p].active && (process_table[p].linked_window == i || process_table[p].parent_window == i)) {
+                                        if (process_table[p].is_critical_io == 1) {
+                                            can_close = 0; // DIVIETO DI CHIUSURA
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if (can_close == 0) {
+                                    // Feedback segreto nel terminale di sistema
+                                    print_term("SISTEMA: Chiusura bloccata. L'app sta leggendo/scrivendo sul disco!");
+                                } 
+                                else {
+                                    // NESSUN PERICOLO: Procediamo con l'animazione e la chiusura
+                                    /*
+                                    anim_start_x = windows[i].x; anim_start_y = windows[i].y; 
+                                    anim_start_w = windows[i].w; anim_start_h = windows[i].h;
+                                    
+                                    // Obiettivo: Collassare al centro lasciando un sottilissimo filo pinstripe di chiusura
+                                    anim_target_x = windows[i].x + (windows[i].w / 2) - 2;
+                                    anim_target_y = windows[i].y + (windows[i].h / 2) - 2;
+                                    anim_target_w = 4; anim_target_h = 4;
+                                    
+                                    anim_frames_total = 40; anim_frames_left = 40; anim_active = 1;
+                                    */
+                                    // === NUOVA LOGICA PARENT-CHILD (CHIUSURA) ===
+                                    for(int p = 1; p < MAX_PROCESSES; p++) {
+                                        // Se è la finestra madre (linked) O il Terminale genitore (parent)
+                                        if (process_table[p].active && (process_table[p].linked_window == i || process_table[p].parent_window == i)) {
+                                            
+                                            // Distruzione ricorsiva delle finestre figlie
+                                            for(int w = 0; w < MAX_WINDOWS; w++) {
+                                                if (windows[w].active && windows[w].owner_pid == p) {
+                                                    windows[w].active = 0;
+                                                }
+                                            }
+                                            
+                                            // Suicidio del processo e liberazione RAM
+                                            process_table[p].active = 0; 
+                                            kfree((void*)process_table[p].stack_base); 
+                                            uint32_t* pt = process_table[p].page_table;
+                                            for (int frame = 0; frame < 1024; frame++) {
+                                                if (pt[frame] & 0x01) pfa_free_frame(pt[frame] & 0xFFFFF000);
+                                            }
+                                            kfree(pt);
+                                        }
+                                    }
+                                    
+                                    // Infine, chiudiamo SEMPRE la finestra
+                                    windows[i].active = 0;
+                                    update_taskbar_state(); // <--- AGGIUNTO QUI
+                                    refresh_requested = 1;
+                                }
+                            }
+                            // B. Rilascio sul bottone MASSIMIZZA
+                            else if (pressed_window_btn == 2 && mouse_x >= max_x && mouse_x <= max_x + 23 && mouse_y >= max_y && mouse_y <= max_y + 19) {
+                                if (windows[i].is_maximized) {
+                                    windows[i].x = windows[i].prev_x; windows[i].y = windows[i].prev_y;
+                                    windows[i].w = windows[i].prev_w; windows[i].h = windows[i].prev_h; windows[i].is_maximized = 0;
+                                } else {
+                                    windows[i].prev_x = windows[i].x; windows[i].prev_y = windows[i].y;
+                                    windows[i].prev_w = windows[i].w; windows[i].prev_h = windows[i].h;
+                                    windows[i].x = 0; windows[i].y = 0; windows[i].w = fb_width; windows[i].h = fb_height - 30;
+                                    windows[i].is_maximized = 1;
+                                }
+                                update_taskbar_state();
+                                refresh_requested = 1;
+                            }
+                            // C. Rilascio sul bottone MINIMIZZA (Target Predittivo Dinamico)
+                            else if (pressed_window_btn == 3 && mouse_x >= min_x && mouse_x <= min_x + 23 && mouse_y >= min_y && mouse_y <= min_y + 19) {
+                                int valid_wins[MAX_WINDOWS]; 
+                                int valid_wins_count = get_taskbar_windows(valid_wins);
+                                int my_tb_index = -1;
+                                for(int tw = 0; tw < valid_wins_count; tw++) { if (valid_wins[tw] == i) my_tb_index = tw; }
+                                
+                                // Calcoliamo la geometria futura della taskbar
+                                int max_tb_w = fb_width - 20;
+                                int min_tb_w = 220;
+                                // Minimizzando, il numero di bottoni sulla barra resta inalterato
+                                int fut_tb_w = min_tb_w + (valid_wins_count * 165);
+                                if (fut_tb_w > max_tb_w) fut_tb_w = max_tb_w;
+                                
+                                int fut_tb_x = (fb_width - fut_tb_w) / 2;
+                                int fut_start_btn_x = fut_tb_x + 7;
+                                int fut_tb_start_x = fut_start_btn_x + 88;
+                                
+                                int fut_clock_x = (fut_tb_x + fut_tb_w) - 33;
+                                int fut_tb_end_x = (fut_clock_x - 26 - 10) - 10;
+                                int fut_tb_area_w = fut_tb_end_x - fut_tb_start_x;
+                                
+                                int target_x = fut_tb_start_x; 
+                                int target_y = fb_height - 28; 
+                                int target_w = 160;
+                                
+                                if (valid_wins_count > 0 && fut_tb_area_w > 0) {
+                                    int btn_w = fut_tb_area_w / valid_wins_count;
+                                    if (btn_w > 160) btn_w = 160; 
+                                    target_w = btn_w - 4; 
+                                    target_x = fut_tb_start_x + (my_tb_index * btn_w);
+                                }
+
+                                anim_start_x = windows[i].x; anim_start_y = windows[i].y; 
+                                anim_start_w = windows[i].w; anim_start_h = windows[i].h;
+                                
+                                // --- FIX BUG SFARFALLIO (RACE CONDITION) ---
+                                // Sincronizziamo subito i valori attuali con la partenza
+                                // in modo che il primo render non usi le vecchie coordinate rimaste sulla taskbar!
+                                anim_x = anim_start_x; anim_y = anim_start_y;
+                                anim_w = anim_start_w; anim_h = anim_start_h;
+                                // -------------------------------------------
+
+                                anim_target_x = target_x; anim_target_y = target_y;
+                                anim_target_w = target_w; anim_target_h = 26;
+                                
+                                anim_frames_total = 40; anim_frames_left = 40; anim_active = 1;
+
+                                windows[i].is_minimized = 1;
+                                int pos = -1; for(int m = 0; m < MAX_WINDOWS; m++) { if (window_order[m] == i) pos = m; }
+                                if (pos != -1) {
+                                    for(int m = pos; m < MAX_WINDOWS - 1; m++) window_order[m] = window_order[m+1];
+                                    window_order[MAX_WINDOWS - 1] = i; 
+                                }
+                                update_taskbar_state();
+                                refresh_requested = 1; 
+                            }
+                        }
+                    }
+
+                    // Reset generale incondizionato al momento in cui si alza il dito dal mouse
+                                        
+                    if (is_clicking == 0) {
+                        dragged_window = -1;
+                        resizing_window = -1;
+                        scrolling_window = -1; 
+                        pressed_window_id = -1; // Azzeriamo il focus dei bottoni
+                        pressed_window_btn = 0; // Cancelliamo l'intenzione
+                        pressed_info_btn = 0;   // Resetta lo stato del tasto Info
+                    }
+
+                    // Applico il movimento alla finestra che stiamo trascinando (se esiste)
+                    if (dragged_window != -1 && windows[dragged_window].active) {
+                        windows[dragged_window].x = mouse_x - drag_offset_x;
+                        
+                        int new_y = mouse_y - drag_offset_y;
+                        
+                        // BUGFIX: Limite Superiore (non uscire dallo schermo in alto)
+                        if (new_y < 0) new_y = 0;
+                        
+                    
+                        // Altezza taskbar (30px) + Altezza barra del titolo (~30px) = 60px di margine
+                        if (new_y > fb_height - 60) new_y = fb_height - 60;
+                        
+                        windows[dragged_window].y = new_y;
+                    }
+
+                    // Applico il ridimensionamento (se esiste)
+                    if (resizing_window != -1 && windows[resizing_window].active) {
+                        // Calcoliamo la nuova grandezza posizionando l'angolo sul cursore
+                        int new_w = mouse_x - windows[resizing_window].x + 8;
+                        int new_h = mouse_y - windows[resizing_window].y + 8;
+                        
+                        // I LIMITI DI ROCCIA: Leggiamo il bounding box minimo calcolato dalla Syscall 7
+                        int limit_w = windows[resizing_window].min_w;
+                        int limit_h = windows[resizing_window].min_h;
+                        
+                        if (new_w < limit_w) new_w = limit_w; 
+                        if (new_h < limit_h) new_h = limit_h; 
+                        
+                        windows[resizing_window].w = new_w;
+                        windows[resizing_window].h = new_h;
+                    }
+                    // Applico il trascinamento della scrollbar del terminale
+                    if (scrolling_window != -1 && windows[scrolling_window].active) {
+                        int i = scrolling_window;
+                        int sb_h = windows[i].h - 36;
+                        int track_h = sb_h - 40;
+                        int draggable_space = track_h - windows[i].t_thumb_h;
+                        
+                        if (draggable_space > 0) {
+                            // 1. Calcoliamo SOLO la differenza di movimento del mouse
+                            int delta_y = mouse_y - scroll_drag_offset_y;
+                            
+                            // 2. Traduciamo i pixel spostati in "righe di testo" da far scorrere
+                            int delta_scroll = (delta_y * windows[i].t_max_scrl) / draggable_space;
+                            
+                            // 3. Applichiamo la differenza al valore iniziale
+                            // (Sottraiamo perché trascinare GIÙ significa andare verso la riga 0)
+                            windows[i].t_scroll = scroll_start_val - delta_scroll;
+                            
+                            // 4. Limiti di sicurezza
+                            if (windows[i].t_scroll < 0) windows[i].t_scroll = 0;
+                            if (windows[i].t_scroll > windows[i].t_max_scrl) windows[i].t_scroll = windows[i].t_max_scrl;
+                        }
+                    }
+                    
+                }
+            } else {
+                // --- LA TASTIERA ---
+                
+                uint8_t scancode = inb(0x60);
+                int top_win = global_active_win; // Usa il vero focus
+                
+                int app_pid = -1;
+                
+                if (top_win != -1) { // PROTEZIONE: Leggiamo solo se una finestra ha il focus!
+                    for(int p=1; p<MAX_PROCESSES; p++) {
+                        // Cerca se c'è un'app ancorata a questa finestra (App testuale) 
+                        // OPPURE se c'è un'app figlia di questa finestra (App GUI lanciata dal terminale)
+                        if (process_table[p].active && 
+                           (process_table[p].linked_window == top_win || process_table[p].parent_window == top_win)) {
+                            app_pid = p;
+                        }
+                    }
+
+                    // SVEGLIA INTELLIGENTE
+                    for(int p=1; p<MAX_PROCESSES; p++) {
+                        if (process_table[p].active && process_table[p].waiting_for_input == 2) {
+                            if (windows[top_win].owner_pid == p) {
+                                process_table[p].waiting_for_input = 0; 
+                            }
+                        }
+                    }
+                }
+
+
+
+                // 1. GESTIONE GLOBALE DEL TASTO SHIFT
+                if (scancode == 0x2A || scancode == 0x36) shift_pressed = 1; 
+                else if (scancode == 0xAA || scancode == 0xB6) shift_pressed = 0;
+
+                // =======================================================
+                // NUOVO: FRECCE DIREZIONALI PER LA TEXTBOX
+                // Scancode: 0x4B (Freccia Sinistra), 0x4D (Freccia Destra)
+                // =======================================================
+                if (scancode == 0x4B) { // Freccia Sinistra
+                    if (focused_window_id != -1 && focused_window_id == top_win) { // Textbox GUI
+                        if (focused_cursor_pos > 0) focused_cursor_pos--;
+                        blink_counter = 0; refresh_requested = 1;
+                    } 
+                    else if (windows[top_win].active && windows[top_win].type == WIN_TYPE_TERMINAL && app_pid == -1) { // Terminale
+                        if (term_cursor > 0) term_cursor--;
+                        blink_counter = 0; refresh_requested = 1;
+                    }
+                }
+                else if (scancode == 0x4D) { // Freccia Destra
+                    if (focused_window_id != -1 && focused_window_id == top_win) { // Textbox GUI
+                        gui_element_t* el = &windows[focused_window_id].ui_elements[focused_element_idx];
+                        int t_len = 0; while (el->text[t_len] != '\0') t_len++;
+                        if (focused_cursor_pos < t_len) focused_cursor_pos++;
+                        blink_counter = 0; refresh_requested = 1;
+                    } 
+                    else if (windows[top_win].active && windows[top_win].type == WIN_TYPE_TERMINAL && app_pid == -1) { // Terminale
+                        if (term_cursor < term_len) term_cursor++;
+                        blink_counter = 0; refresh_requested = 1;
+                    }
+                }
+
+
+                if (scancode < 128) {
+                    char ascii = scancode_to_ascii[scancode];
+                    
+                    if (ascii != 0) {
+                        // 2. TRADUZIONE SIMBOLI UNIVERSALE (Valida per Kernel e App)
+                        if (shift_pressed) {
+                            if (ascii >= 'a' && ascii <= 'z') ascii -= 32; 
+                            else if (ascii == '1') ascii = '!';
+                            else if (ascii == '9') ascii = '(';
+                            else if (ascii == '0') ascii = ')';
+                            else if (ascii == '[') ascii = '{';
+                            else if (ascii == ']') ascii = '}';
+                            else if (ascii == ';') ascii = ':';
+                            else if (ascii == ',') ascii = '<';
+                            else if (ascii == '.') ascii = '>';
+                            else if (ascii == '/') ascii = '?';
+                            else if (ascii == '-') ascii = '_';
+                            else if (ascii == '=') ascii = '+';
+                            else if (ascii == '\'') ascii = '"';
+                        }
+                        
+                        // LA PATCH DEFINITIVA ANTI-FANTASMA
+                        if (app_pid > 0) last_key_pressed = ascii;
+                        else last_key_pressed = 0;
+
+                        // =======================================================
+                        // CASO 0: STIAMO SCRIVENDO IN UNA TEXTBOX GUI! (Priorità Massima)
+                        // =======================================================
+                        if (focused_window_id != -1 && focused_window_id == top_win && focused_element_idx != -1) {
+                            gui_element_t* el = &windows[focused_window_id].ui_elements[focused_element_idx];
+                            
+                            int t_len = 0; 
+                            while (el->text[t_len] != '\0') t_len++;
+                            
+                            // BACKSPACE: Cancelliamo la lettera PRIMA del cursore
+                            if (ascii == '\b') {
+                                if (focused_cursor_pos > 0) {
+                                    // Spostiamo tutto l'array a sinistra (incluso il terminatore \0)
+                                    for (int k = focused_cursor_pos; k <= t_len; k++) {
+                                        el->text[k - 1] = el->text[k];
+                                    }
+                                    focused_cursor_pos--;
+                                }
+                            } 
+                            // CARATTERI NORMALI: Inseriamo esattamente in mezzo
+                            else if (ascii >= 32 && ascii <= 126) {
+                                int max_chars = el->color2; 
+                                if (max_chars <= 0 || max_chars > 250) max_chars = 250;
+                                
+                                if (t_len < max_chars) {
+                                    // Spostiamo tutto l'array a destra per fare spazio (incluso il \0)
+                                    for (int k = t_len; k >= focused_cursor_pos; k--) {
+                                        el->text[k + 1] = el->text[k];
+                                    }
+                                    el->text[focused_cursor_pos] = ascii;
+                                    focused_cursor_pos++;
+                                }
+                            }
+                            
+                            blink_counter = 0; // Teniamo il cursore acceso mentre digitiamo
+                            refresh_requested = 1; 
+                        }
+
+                        // CASO 1: STIAMO SCRIVENDO DENTRO UN'APP
+                        if (app_pid > 0 && process_table[app_pid].waiting_for_input) {
+                            
+                            // ==========================================
+                            // Montiamo la Page Table dell'App
+                            // prima di scrivere nel suo buffer (Ring 3)!
+                            // ==========================================
+                            uint32_t flags;
+                            asm volatile("pushf \n pop %0 \n cli" : "=r"(flags));
+                            
+                            // Colleghiamo l'indirizzo 0x40000000 alla RAM vera di questa App
+                            page_directory[256] = ((uint32_t)process_table[app_pid].page_table) | 0x07;
+                            asm volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax"); // Flush TLB
+
+
+                            if (ascii == '\n') {
+                                process_table[app_pid].input_buffer[process_table[app_pid].input_idx] = '\0';
+                                
+                                int old_pid = current_pid; current_pid = app_pid; 
+                                print_term(""); 
+                                current_pid = old_pid;
+                                
+                                process_table[app_pid].waiting_for_input = 0; 
+                            }
+                            else if (ascii == '\b') {
+                                if (process_table[app_pid].input_idx > 0) {
+                                    process_table[app_pid].input_idx--;
+                                    process_table[app_pid].input_buffer[process_table[app_pid].input_idx] = '\0';
+                                    
+                                    int last_row = windows[top_win].t_head - 1;
+                                    if (last_row < 0) last_row = TERM_MAX_ROWS - 1;
+                                    windows[top_win].t_history[last_row][process_table[app_pid].input_idx + 2] = '\0'; 
+                                }
+                            }
+                            else if (ascii >= 32 && ascii <= 126 && process_table[app_pid].input_idx < process_table[app_pid].input_max - 1) {
+                                process_table[app_pid].input_buffer[process_table[app_pid].input_idx] = ascii;
+                                process_table[app_pid].input_idx++;
+                                process_table[app_pid].input_buffer[process_table[app_pid].input_idx] = '\0';
+                                
+                                int last_row = windows[top_win].t_head - 1;
+                                if (last_row < 0) last_row = TERM_MAX_ROWS - 1;
+                                windows[top_win].t_history[last_row][process_table[app_pid].input_idx + 1] = ascii;
+                                windows[top_win].t_history[last_row][process_table[app_pid].input_idx + 2] = '\0';
+                            }
+
+                            // ==========================================
+                            // FINE ZONA CRITICA: Smontiamo la Page Table dell'App
+                            // e riaccendiamo gli interrupt
+                            // ==========================================
+                            page_directory[256] = 0;
+                            asm volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax");
+                            asm volatile("push %0 \n popf" :: "r"(flags));
+                        }
+                        // CASO 2: STIAMO SCRIVENDO NEL TERMINALE DEL KERNEL
+                        else if (top_win != -1 && windows[top_win].active && windows[top_win].type == WIN_TYPE_TERMINAL && app_pid == -1) {
+                            if (ascii == '\b') {
+                                if (term_cursor > 0) {
+                                    // Spostiamo tutto l'array a sinistra (sovrascrivendo la lettera)
+                                    for (int k = term_cursor; k <= term_len; k++) {
+                                        term_buffer[k - 1] = term_buffer[k];
+                                    }
+                                    term_cursor--;
+                                    term_len--;
+                                }
+                            }
+                            else if (ascii == '\n') {
+                                term_buffer[term_len] = '\0';
+                                
+                                char echo_buf[260]; // Espanso per contenere i nuovi comandi massicci
+                                echo_buf[0] = '>'; echo_buf[1] = ' '; 
+                                int e_idx = 2;
+                                for(int i=0; i<term_len && e_idx < 258; i++) echo_buf[e_idx++] = term_buffer[i];
+                                echo_buf[e_idx] = '\0';
+                                
+                                if (term_len > 0) print_term(echo_buf); 
+                                
+                                // =======================================================
+                                // MACCHINA A STATI: INTERCETTAZIONE RISPOSTA (y/n)
+                                // =======================================================
+                                if (pending_rmdir == 1) {
+                                    if (term_buffer[0] == 'y' || term_buffer[0] == 'Y') {
+                                        print_term("Inizio protocollo di annientamento ricorsivo...");
+                                        render_desktop(mouse_x, mouse_y, is_clicking);
+                                        
+                                        // CHIAMATA ALLA VERA API DEL KERNEL!
+                                        int res = ext2_remove_directory(pending_rmdir_path);
+                                        
+                                        if (res == 1) print_term("SUCCESSO! Cartella e contenuto vaporizzati.");
+                                        else if (res == -1) print_term("ERRORE: Il percorso punta a un file. Usa 'rm'.");
+                                        else print_term("ERRORE: Impossibile eliminare (percorso errato).");
+                                        
+                                        pending_rmdir = 0;
+                                    }
+                                    else if (term_buffer[0] == 'n' || term_buffer[0] == 'N') {
+                                        print_term("Operazione annullata. La cartella e' salva.");
+                                        pending_rmdir = 0;
+                                    } 
+                                    else {
+                                        print_term("Rispondi 'y' per confermare o 'n' per annullare.");
+                                    }
+                                    
+                                    term_len = 0;
+                                    term_cursor = 0; 
+                                    continue; // Salta tutti gli altri comandi
+                                }
+
+
+                                if (term_buffer[0] == 'h' && term_buffer[1] == 'e' && term_buffer[2] == 'l' && term_buffer[3] == 'p') {
+                                    
+                                    print_term("===== AIUTO DI SISTEMA (ANTE-M OS) =====");
+                                    print_term(" - help : Mostra questo menu");
+                                    print_term("--- FILE SYSTEM ---");
+                                    print_term(" - ls [path]        : Elenca file e directory");
+                                    print_term(" - mkdir [path]     : Crea una nuova cartella");
+                                    print_term(" - rmdir [path]     : Rimuove dir, dub-dir e file");
+                                    print_term(" - cp [file] [path] : copia un file in una cartella");
+                                    print_term(" - cat [path]       : Legge il contenuto di un file");
+                                    print_term(" - rm [path]        : Elimina file (non cartelle)");
+                                    print_term(" - fsinfo           : Statistiche disco Ext2");
+                                    print_term("--- SISTEMA E MULTITASKING ---");
+                                    print_term(" - run [app]        : Lancia eseguibile .edxi");
+                                    print_term(" - ps               : Lista processi attivi");
+                                    print_term(" - kill [PID]       : Termina un processo");
+                                    print_term(" - meminfo          : Stato Heap e RAM Kernel");
+                                    print_term(" - time             : Data e ora dal chip CMOS");
+                                    print_term(" - pci              : Scansione bus PCI");
+                                    print_term(" - info / clear     : Info sistema / Pulisci");
+                                    print_term("=========================================");
+
+                                }
+                                else if (term_buffer[0] == 'i' && term_buffer[1] == 'n' && term_buffer[2] == 'f' && term_buffer[3] == 'o') {
+                                    print_term("Ante-Millennium OS v0.1 - Architettura x86");
+                                    print_term("Alpha - Build 110");
+                                    print_term("Developed by Alberto Sanfelice");
+                                    print_term("511utilities.org");
+                                }
+                                else if (term_buffer[0] == 'c' && term_buffer[1] == 'l' && term_buffer[2] == 'e' && term_buffer[3] == 'a' && term_buffer[4] == 'r') {
+                                    for(int i=0; i<TERM_MAX_ROWS; i++) term_history[i][0] = '\0'; 
+                                }
+                                else if (term_buffer[0] == 'r' && term_buffer[1] == 'e' && term_buffer[2] == 'a' && term_buffer[3] == 'd' && term_buffer[4] == '\0') {
+                                    print_term("Lettura disco in corso...");
+                                    render_desktop(mouse_x, mouse_y, is_clicking);
+                                    
+                                    uint8_t sector_buffer[512]; 
+                                    if (ata_read_sector(0, sector_buffer)) {
+                                        char disk_msg[55];
+                                        int i;
+                                        for(i = 0; i < 50; i++) {
+                                            if (sector_buffer[i] >= 32 && sector_buffer[i] <= 126) disk_msg[i] = sector_buffer[i];
+                                            else disk_msg[i] = '.';
+                                        }
+                                        disk_msg[i] = '\0';
+                                        print_term("Dati LBA 0:");
+                                        print_term(disk_msg);
+                                    } else {
+                                        print_term("ERRORE: Disco non trovato!");
+                                    }
+                                }
+                                else if (term_buffer[0] == 'w' && term_buffer[1] == 'r' && term_buffer[2] == 'i' && term_buffer[3] == 't' && term_buffer[4] == 'e') {
+                                    print_term("Scrittura su disco in corso...");
+                                    render_desktop(mouse_x, mouse_y, is_clicking);
+                                    
+                                    uint8_t sector_buffer[512]; 
+                                    for(int i=0; i<512; i++) {sector_buffer[i] = 0;}
+
+                                    int i = 6;
+                                    int buf_idx = 0;
+                                    while(term_buffer[i] != '\0' && buf_idx < 511) {
+                                        sector_buffer[buf_idx] = term_buffer[i];
+                                        i++;
+                                        buf_idx++;
+                                    }
+
+                                    if (ata_write_sector(1, sector_buffer)) {
+                                        print_term("SUCCESSO: Dati incisi sul disco!");
+                                    } else {
+                                        print_term("ERRORE: Scrittura fallita.");
+                                    }
+                                }
+                                else if (term_buffer[0] == 'r' && term_buffer[1] == 'e' && term_buffer[2] == 'a' && term_buffer[3] == 'd' && term_buffer[4] == '1') {
+                                    print_term("Lettura LBA 1 in corso...");
+                                    render_desktop(mouse_x, mouse_y, is_clicking);
+                                    
+                                    uint8_t sector_buffer[512]; 
+                                    if (ata_read_sector(1, sector_buffer)) {
+                                        char disk_msg[55];
+                                        int i;
+                                        for(i = 0; i < 50; i++) {
+                                            if (sector_buffer[i] == 0) break; 
+                                            if (sector_buffer[i] >= 32 && sector_buffer[i] <= 126) disk_msg[i] = sector_buffer[i];
+                                            else disk_msg[i] = '.';
+                                        }
+                                        disk_msg[i] = '\0';
+                                        print_term("Contenuto Settore 1:");
+                                        print_term(disk_msg);
+                                    } else {
+                                        print_term("ERRORE: Lettura fallita.");
+                                    }
+                                }
+                                // COMANDO TIME
+                                else if (term_buffer[0] == 't' && term_buffer[1] == 'i' && term_buffer[2] == 'm' && term_buffer[3] == 'e' && term_buffer[4] == '\0') {
+                                    read_rtc();
+                                    char t_msg[] = "Data e Ora: 00:00:00 - 00/00/2000";
+                                    put_2digits(rtc_hour, t_msg, 12);
+                                    put_2digits(rtc_minute, t_msg, 15);
+                                    put_2digits(rtc_second, t_msg, 18);
+                                    put_2digits(rtc_day, t_msg, 23);
+                                    put_2digits(rtc_month, t_msg, 26);
+                                    if (rtc_year < 80) { t_msg[29] = '2'; t_msg[30] = '0'; } 
+                                    else { t_msg[29] = '1'; t_msg[30] = '9'; }
+                                    put_2digits(rtc_year, t_msg, 31);
+                                    
+                                    print_term(t_msg);
+                                }
+
+
+                                // COMANDO PCI (Scansione hardware)
+                                else if (term_buffer[0] == 'p' && term_buffer[1] == 'c' && term_buffer[2] == 'i' && term_buffer[3] == '\0') {
+                                    pci_scan();
+                                }
+
+
+                                // COMANDO FSINFO (Interroga il file system ext2)
+                                else if (term_buffer[0] == 'f' && term_buffer[1] == 's' && term_buffer[2] == 'i' && term_buffer[3] == 'n' && term_buffer[4] == 'f' && term_buffer[5] == 'o') {
+                                    uint8_t sector_buffer[512] = {0}; 
+                                    
+                                    // Leggiamo LBA 2 (che contiene il Byte 1024)
+                                    if (ata_read_sector(2, sector_buffer)) {
+                                        
+                                        // IL TRUCCO ANTI-COMPILATORE: Copia manuale della memoria
+                                        ext2_superblock_t sb;
+                                        uint8_t* dst = (uint8_t*)&sb;
+                                        for(size_t i = 0; i < sizeof(ext2_superblock_t); i++) {
+                                            dst[i] = sector_buffer[i];
+                                        }
+                                        
+                                        // Ora usiamo 'sb.' invece di 'sb->' perché è una vera variabile!
+                                        if (sb.s_magic == 0xEF53) {
+                                            print_term("Rilevato File System EXT2 Valido");
+                                            
+                                            char num_buf[32];
+                                            char msg[64];
+                                            
+                                            // Stampa Inodes
+                                            itoa(sb.s_inodes_count, num_buf);
+                                            msg[0]='\0'; 
+                                            int idx = 0; char* label = "Inodes totali: ";
+                                            while(*label) msg[idx++] = *label++;
+                                            char* val = num_buf;
+                                            while(*val) msg[idx++] = *val++;
+                                            msg[idx] = '\0';
+                                            print_term(msg);
+
+                                            // Stampa Blocchi
+                                            itoa(sb.s_blocks_count, num_buf);
+                                            msg[0]='\0'; idx=0; label = "Blocchi totali: ";
+                                            while(*label) msg[idx++] = *label++;
+                                            val = num_buf;
+                                            while(*val) msg[idx++] = *val++;
+                                            msg[idx] = '\0';
+                                            print_term(msg);
+                                            
+                                        } else {
+                                            print_term("File system sconosciuto o non formattato.");
+                                        }
+                                    } else {
+                                        print_term("ERRORE: Impossibile leggere il disco.");
+                                    }
+                                }
+                                
+                                // COMANDO LS (Esplora la directory specificata, o Root di default)
+                                else if (term_buffer[0] == 'l' && term_buffer[1] == 's' && (term_buffer[2] == '\0' || term_buffer[2] == ' ')) {
+                                    char target_dir[64];
+                                    
+                                    // Se scrivo solo "ls", il percorso di default è "/"
+                                    if (term_buffer[2] == '\0') {
+                                        target_dir[0] = '/'; target_dir[1] = '\0';
+                                    } else {
+                                        int idx = 3;
+                                        int f_idx = 0;
+                                        // Se non metto lo slash iniziale, lo aggiunge il Kernel
+                                        if (term_buffer[idx] != '/') {
+                                            target_dir[f_idx++] = '/';
+                                        }
+                                        while (term_buffer[idx] != ' ' && term_buffer[idx] != '\0' && f_idx < 63) {
+                                            target_dir[f_idx++] = term_buffer[idx++];
+                                        }
+                                        target_dir[f_idx] = '\0';
+                                    }
+
+                                    // Chiediamo al Path Parser l'Inode della cartella
+                                    uint32_t target_inode_num = ext2_resolve_path(target_dir);
+                                    
+                                    if (target_inode_num == 0) {
+                                        print_term("ERRORE: Cartella inesistente o percorso errato.");
+                                    } else {
+                                        uint8_t sector_buffer[1024] = {0};
+                                        if (ata_read_sector(4, sector_buffer)) {
+                                            ext2_bg_desc_t bgd; uint8_t* dst = (uint8_t*)&bgd;
+                                            for(size_t i=0; i<sizeof(ext2_bg_desc_t); i++) dst[i] = sector_buffer[i];
+                                            uint32_t inode_table_lba = bgd.bg_inode_table * 2;
+                                            
+                                            uint32_t inode_size = 128;
+                                            if (ata_read_sector(inode_table_lba, sector_buffer)) {
+                                                ext2_inode_t root_test; dst = (uint8_t*)&root_test;
+                                                for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[128 + i];
+                                                if ((root_test.i_mode & 0xF000) != 0x4000) inode_size = 256;
+
+                                                // Carichiamo l'Inode della NOSTRA cartella bersaglio!
+                                                uint32_t index = target_inode_num - 1;
+                                                uint32_t sect_off = (index * inode_size) / 512;
+                                                uint32_t in_sect_off = (index * inode_size) % 512;
+
+                                                if (ata_read_sector(inode_table_lba + sect_off, sector_buffer)) {
+                                                    ext2_inode_t target_inode; dst = (uint8_t*)&target_inode;
+                                                    for(size_t i=0; i<sizeof(ext2_inode_t); i++) dst[i] = sector_buffer[in_sect_off + i];
+
+                                                    // Muro di Mattoni: Ci assicuriamo che l'utente non abbia provato a fare "ls file.txt"
+                                                    if ((target_inode.i_mode & 0xF000) == 0x4000) {
+                                                        uint32_t dir_block_lba = target_inode.i_block[0] * 2;
+                                                        
+                                                        if (ata_read_sector(dir_block_lba, sector_buffer) && ata_read_sector(dir_block_lba + 1, sector_buffer + 512)) {
+                                                            char msg_start[100];
+                                                            int s_idx = 0; char* lbl = "Contenuto di ";
+                                                            while(*lbl) msg_start[s_idx++] = *lbl++;
+                                                            char* val = target_dir;
+                                                            while(*val && s_idx < 98) msg_start[s_idx++] = *val++;
+                                                            msg_start[s_idx++] = ':'; msg_start[s_idx] = '\0';
+                                                            print_term(msg_start);
+                                                            
+                                                            uint32_t offset = 0;
+                                                            while (offset < 1024) {
+                                                                ext2_dir_entry_t entry; uint8_t* edst = (uint8_t*)&entry;
+                                                                for(size_t i = 0; i < sizeof(ext2_dir_entry_t); i++) edst[i] = sector_buffer[offset + i];
+                                                                if (entry.inode == 0) break; 
+                                                                
+                                                                char filename[256];
+                                                                for (int k = 0; k < entry.name_len; k++) filename[k] = sector_buffer[offset + 8 + k];
+                                                                filename[entry.name_len] = '\0';
+                                                                
+                                                                char msg[64]; int idx = 0;
+                                                                if (entry.file_type == 2) {
+                                                                    msg[idx++]='['; msg[idx++]='D'; msg[idx++]='I'; msg[idx++]='R'; msg[idx++]=' '; msg[idx++]=']'; msg[idx++]=' ';
+                                                                } else {
+                                                                    int len = entry.name_len; int is_app = 0;
+                                                                    if (len >= 5 && filename[len-5] == '.' && filename[len-4] == 'e' && filename[len-3] == 'd' && filename[len-2] == 'x' && filename[len-1] == 'i') is_app = 1;
+                                                                    if (len >= 4 && filename[len-4] == '.' && filename[len-3] == 'b' && filename[len-2] == 'i' && filename[len-1] == 'n') is_app = 1;
+                                                                    
+                                                                    if (is_app) { msg[idx++]='['; msg[idx++]='A'; msg[idx++]='P'; msg[idx++]='P'; msg[idx++]=' '; msg[idx++]=']'; msg[idx++]=' '; } 
+                                                                    else { msg[idx++]='['; msg[idx++]='F'; msg[idx++]='I'; msg[idx++]='L'; msg[idx++]='E'; msg[idx++]=']'; msg[idx++]=' '; }
+                                                                }
+                                                                
+                                                                val = filename; while(*val && idx < 63) msg[idx++] = *val++;
+                                                                msg[idx] = '\0';
+                                                                print_term(msg);
+                                                                
+                                                                if (entry.rec_len == 0) break;
+                                                                offset += entry.rec_len;
+                                                            }
+                                                        } else print_term("Errore lettura dati Directory.");
+                                                    } else print_term("Errore: Il percorso non e' una cartella.");
+                                                } else print_term("Errore lettura Inode del percorso.");
+                                            } else print_term("Errore lettura Inode Table.");
+                                        } else print_term("Errore lettura BGDT.");
+                                    }
+                                }
+
+                                // COMANDO CAT (Es: "cat /users/admin/docs/test.txt")
+                                else if (term_buffer[0] == 'c' && term_buffer[1] == 'a' && term_buffer[2] == 't' && term_buffer[3] == ' ') {
+                                    char full_file[64];
+                                    int idx = 4;
+                                    int f_idx = 0;
+                                    
+                                    // Aggiunge lo slash se dimenticato
+                                    if (term_buffer[idx] != '/') full_file[f_idx++] = '/';
+                                    while(term_buffer[idx] != '\0' && term_buffer[idx] != ' ' && f_idx < 63) {
+                                        full_file[f_idx++] = term_buffer[idx++];
+                                    }
+                                    full_file[f_idx] = '\0';
+
+                                    char* file_buf = (char*)kmalloc(4096); // Usiamo l'Heap del Kernel in sicurezza
+                                    if (file_buf) {
+                                        // Lasciamo fare TUTTO il lavoro sporco alla nuova API!
+                                        if (ext2_read_file(full_file, file_buf, 4095, 0)) {
+                                            print_term("--- INIZIO FILE ---");
+                                            char line_buf[513];
+                                            int line_idx = 0;
+                                            for(int j=0; file_buf[j] != '\0'; j++) {
+                                                char c = file_buf[j];
+                                                if (c == '\n') {
+                                                    line_buf[line_idx] = '\0';
+                                                    print_term(line_buf);
+                                                    line_idx = 0;
+                                                } else if (c >= 32 && c <= 126 && line_idx < 512) {
+                                                    line_buf[line_idx++] = c;
+                                                }
+                                            }
+                                            if (line_idx > 0) {
+                                                line_buf[line_idx] = '\0';
+                                                print_term(line_buf);
+                                            }
+                                            print_term("--- FINE FILE ---");
+                                        } else {
+                                            print_term("ERRORE: File non trovato o percorso errato.");
+                                        }
+                                        kfree(file_buf);
+                                    } else {
+                                        print_term("ERRORE: RAM insufficiente per cat.");
+                                    }
+                                }
+
+                                // COMANDO MEMINFO (Stato della RAM)
+                                else if (term_buffer[0] == 'm' && term_buffer[1] == 'e' && term_buffer[2] == 'm' && term_buffer[3] == 'i' && term_buffer[4] == 'n' && term_buffer[5] == 'f' && term_buffer[6] == 'o') {
+                                    
+                                    // 1. STATISTICHE HEAP DEL KERNEL (kmalloc)
+                                    size_t total_free_k = 0;
+                                    size_t total_used_k = 0;
+                                    mem_block_t* current = heap_head;
+                                    while (current != NULL) {
+                                        if (current->is_free) total_free_k += current->size;
+                                        else total_used_k += current->size;
+                                        current = current->next;
+                                    }
+                                    
+                                    // 2. STATISTICHE RAM FISICA DELLE APP (Demand Paging / PFA)
+                                    uint32_t pfa_free_frames = 0;
+                                    uint32_t pfa_used_frames = 0;
+                                    for (uint32_t i = 0; i < (pfa_max_frames / 32) + 1; i++) {
+                                        for (int bit = 0; bit < 32; bit++) {
+                                            uint32_t frame_index = (i * 32) + bit;
+                                            if (frame_index >= pfa_max_frames) break; // Non contare l'esubero
+                                            
+                                            if ((pfa_bitmap[i] & (1 << bit)) == 0) pfa_free_frames++;
+                                            else pfa_used_frames++;
+                                        }
+                                    }
+                                    
+                                    // Convertiamo i frame in Megabyte per una lettura più facile
+                                    uint32_t pfa_free_mb = (pfa_free_frames * 4096) / (1024 * 1024);
+                                    uint32_t pfa_used_mb = (pfa_used_frames * 4096) / (1024 * 1024);
+                                    
+                                    char num_buf[32];
+                                    char msg[64];
+                                    
+                                    print_term("=== STATO DELLA MEMORIA (ANTE-M OS) ===");
+                                    print_term("[ RING 0 - KERNEL HEAP ]");
+                                    
+                                    itoa(total_used_k, num_buf);
+                                    msg[0]='\0'; int idx=0; char* label = "  Utilizzata (Bytes) : ";
+                                    while(*label) msg[idx++] = *label++;
+                                    char* val = num_buf; while(*val) msg[idx++] = *val++; msg[idx]='\0';
+                                    print_term(msg);
+
+                                    itoa(total_free_k, num_buf);
+                                    msg[0]='\0'; idx=0; label = "  Libera (Bytes)     : ";
+                                    while(*label) msg[idx++] = *label++;
+                                    val = num_buf; while(*val) msg[idx++] = *val++; msg[idx]='\0';
+                                    print_term(msg);
+                                    
+                                    print_term("[ RING 3 - RAM FISICA APP ]");
+                                    
+                                    itoa(pfa_used_mb, num_buf);
+                                    msg[0]='\0'; idx=0; label = "  Utilizzata (MB)    : ";
+                                    while(*label) msg[idx++] = *label++;
+                                    val = num_buf; while(*val) msg[idx++] = *val++; msg[idx]='\0';
+                                    print_term(msg);
+                                    
+                                    itoa(pfa_free_mb, num_buf);
+                                    msg[0]='\0'; idx=0; label = "  Libera (MB)        : ";
+                                    while(*label) msg[idx++] = *label++;
+                                    val = num_buf; while(*val) msg[idx++] = *val++; msg[idx]='\0';
+                                    print_term(msg);
+                                    print_term("=======================================");
+                                }
+                                // COMANDO SYSCALL (Testiamo l'Interrupt Descriptor Table)
+                                else if (term_buffer[0] == 's' && term_buffer[1] == 'y' && term_buffer[2] == 's' && term_buffer[3] == 'c' && term_buffer[4] == 'a' && term_buffer[5] == 'l' && term_buffer[6] == 'l') {
+                                    print_term("Lancio interruzione software 0x80 al processore...");
+                                    
+                                    // Chiamata Assembly pura che blocca la CPU e salta alla nostra IDT
+                                    asm volatile ("int $0x80");
+                                    
+                                    print_term("Ritorno al Terminale avvenuto con successo.");
+                                }
+                                
+                                
+                                
+                                // COMANDO RUN (Es: "run /editor.edxi" oppure comodamente "run editor.edxi")
+                                else if (term_buffer[0] == 'r' && term_buffer[1] == 'u' && term_buffer[2] == 'n' && term_buffer[3] == ' ') {
+                                    char target_file[64];
+                                    int t_idx = 0; int idx = 4;
+                                    
+                                    // Se l'utente non ha messo lo slash iniziale, aggiungiamo solo '/'
+                                    // in modo da cercare l'app nella Root, coerentemente con gli altri comandi.
+                                    if (term_buffer[idx] != '/') {
+                                        target_file[t_idx++] = '/';
+                                    }
+                                    
+                                    while(term_buffer[idx] != '\0' && t_idx < 63) {
+                                        target_file[t_idx++] = term_buffer[idx++];
+                                    }
+                                    target_file[t_idx] = '\0';
+
+                                    int is_bin = 0;
+                                    int is_edxi = 0;
+                                    if (t_idx >= 4 && target_file[t_idx-4] == '.' && target_file[t_idx-3] == 'b' && target_file[t_idx-2] == 'i' && target_file[t_idx-1] == 'n') is_bin = 1;
+                                    if (t_idx >= 5 && target_file[t_idx-5] == '.' && target_file[t_idx-4] == 'e' && target_file[t_idx-3] == 'd' && target_file[t_idx-2] == 'x' && target_file[t_idx-1] == 'i') is_edxi = 1;
+
+                                    if (!is_bin && !is_edxi) {
+                                        print_term("ERRORE: Formato non supportato. Usa .bin o .edxi");
+                                    } 
+                                    else {
+                                        // Diamo 2 Megabyte di RAM all'app per girare e fare le malloc in comodità
+                                        //int total_ram_for_app = 2048 * 1024;
+                                        // 1. Creiamo la Page Table privata per questa App (4KB)
+                                        uint32_t* app_pt = (uint32_t*)kmalloc(4096);
+
+                                        if (app_pt) {
+                                            // Puliamo la tabella (tutto non mappato)
+                                            for(int k=0; k<1024; k++) app_pt[k] = 0;
+
+                                            // 2. Leggiamo il file in un buffer temporaneo del Kernel
+                                            uint32_t actual_size = 0;
+                                            void* temp_buffer = kmalloc(2000000); // Alzato a 2 MB per reggere TCC!
+                                            
+                                            if (temp_buffer && ext2_read_file(target_file, (char*)temp_buffer, 2000000, &actual_size)) {
+                                                
+                                                // 3. Quanti frame fisici servono ESATTAMENTE per il codice dell'app?
+                                                uint32_t frames_needed = (actual_size / 4096) + 1;
+                                                
+                                                // 4. Allochiamo e mappiamo solo lo stretto necessario!
+                                                for(uint32_t f = 0; f < frames_needed; f++) {
+                                                    uint32_t phys_frame = pfa_alloc_frame();
+                                                    app_pt[f] = phys_frame | 0x07; // Present, R/W, User Ring 3
+                                                    
+                                                    // Copiamo i dati dal buffer temporaneo al frame fisico
+                                                    uint8_t* dest = (uint8_t*)phys_frame; // Identity mapping ci permette di scriverci direttamente
+                                                    uint8_t* src = (uint8_t*)temp_buffer + (f * 4096);
+                                                    for(int b = 0; b < 4096; b++) {
+                                                        if ((f * 4096 + b) < actual_size) {
+                                                            dest[b] = src[b];
+                                                        } else {
+                                                            dest[b] = 0; // AZZERIAMO LA CODA DEL FRAME (Fondamentale per la .bss)
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                kfree(temp_buffer); // Finito! Liberiamo il buffer temporaneo
+
+                                                // Puntiamo al primo frame fisico per leggere l'header EDXI
+                                                uint8_t* mem_ptr = (uint8_t*)(app_pt[0] & 0xFFFFF000); 
+
+                                                // === IL PARSER DELL'HEADER EDXI UNIFICATO ===
+                                                int is_gui = 0;
+                                                int is_virtual = 0; 
+                                                uint32_t entry_offset = 0;
+                                                
+                                                if (is_edxi) {
+                                                    if (mem_ptr[0] == 'E' && mem_ptr[1] == 'D' && mem_ptr[2] == 'X' && mem_ptr[3] == 'I') {
+                                                        if (mem_ptr[4] == 1) is_gui = 1;
+                                                        if (mem_ptr[5] == 1) is_virtual = 1; 
+                                                        entry_offset = 16; 
+                                                    } else {
+                                                        print_term("ERRORE: File .edxi corrotto.");
+                                                        // Se l'app fallisce, dobbiamo pulire subito!
+                                                        for(uint32_t f = 0; f < frames_needed; f++) pfa_free_frame(app_pt[f] & 0xFFFFF000);
+                                                        kfree(app_pt);
+                                                        continue; 
+                                                    }
+                                                }
+                                                
+                                                if (!is_virtual || !is_edxi) {
+                                                    print_term("SICUREZZA: App obsoleta (Ring 0). Esecuzione bloccata!");
+                                                    for(uint32_t f = 0; f < frames_needed; f++) pfa_free_frame(app_pt[f] & 0xFFFFF000);
+                                                    kfree(app_pt);
+                                                    continue;
+                                                }
+                                                
+                                                print_term("Lancio Eseguibile (Demand Paging Attivo)...");
+
+                                                // Il Pointer in Assembly rimane lo stesso (L'offset virtuale fisso a 0x40000010)
+                                                void (*app_func)(void) = (void (*)(void))(0x40000000 + entry_offset);
+                                                
+                                                int new_pid = get_free_pid();
+                                                if (new_pid != -1) {
+                                                    if (is_gui) {
+                                                        int app_win_id = open_window(WIN_TYPE_APP_GUI, target_file, 150, 150, 400, 300, new_pid);
+                                                        create_process(app_func, app_win_id, app_pt, is_virtual, top_win, new_pid); 
+                                                    } else {
+                                                        create_process(app_func, window_order[0], app_pt, is_virtual, top_win, new_pid);
+                                                    }
+                                                } else {
+                                                    print_term("ERRORE: Raggiunto il limite massimo di processi attivi.");
+                                                    for(uint32_t f = 0; f < frames_needed; f++) pfa_free_frame(app_pt[f] & 0xFFFFF000);
+                                                    kfree(app_pt);
+                                                }
+                                            } else {
+                                                print_term("Errore: Impossibile leggere il file o percorso errato.");
+                                                if (temp_buffer) kfree(temp_buffer);
+                                                kfree(app_pt);
+                                            }
+                                        } else {
+                                            print_term("Errore: Impossibile creare la Page Table!");
+                                        }
+                                    }
+                                }
+
+
+                                // COMANDO PS (Lista i processi in esecuzione)
+                                else if (term_buffer[0] == 'p' && term_buffer[1] == 's' && term_buffer[2] == '\0') {
+                                    print_term("PID | WIN | STATO");
+                                    print_term("-------------------");
+                                    
+                                    int found = 0;
+                                    for (int p = 1; p < MAX_PROCESSES; p++) {
+                                        if (process_table[p].active) {
+                                            found = 1;
+                                            char msg[64];
+                                            
+                                            // Assembliamo la stringa a mano per non usare librerie esterne
+                                            msg[0] = ' '; itoa(p, msg + 1);
+                                            int len = 0; while(msg[len]) len++;
+                                            while(len < 6) msg[len++] = ' ';
+                                            msg[len++] = '|'; msg[len++] = ' ';
+                                            
+                                            itoa(process_table[p].linked_window, msg + len);
+                                            while(msg[len]) len++;
+                                            while(len < 12) msg[len++] = ' ';
+                                            msg[len++] = '|'; msg[len++] = ' ';
+                                            
+                                            if (process_table[p].waiting_for_input) {
+                                                msg[len++]='S'; msg[len++]='L'; msg[len++]='E'; msg[len++]='E'; msg[len++]='P';
+                                            } else {
+                                                msg[len++]='R'; msg[len++]='U'; msg[len++]='N';
+                                            }
+                                            msg[len] = '\0';
+                                            print_term(msg);
+                                        }
+                                    }
+                                    if (!found) print_term("Nessuna app in background.");
+                                }
+                                
+                                // COMANDO KILL (Es: "kill 2")
+                                else if (term_buffer[0] == 'k' && term_buffer[1] == 'i' && term_buffer[2] == 'l' && term_buffer[3] == 'l' && term_buffer[4] == ' ') {
+                                    int pid_to_kill = 0;
+                                    int idx = 5;
+                                    
+                                    // Estraiamo il numero digitato dall'utente
+                                    while (term_buffer[idx] >= '0' && term_buffer[idx] <= '9') {
+                                        pid_to_kill = pid_to_kill * 10 + (term_buffer[idx] - '0');
+                                        idx++;
+                                    }
+                                    
+                                    // Se il processo esiste ed è un'app (PID > 0), lo annientiamo
+                                    if (pid_to_kill > 0 && pid_to_kill < MAX_PROCESSES && process_table[pid_to_kill].active) {
+                                        process_table[pid_to_kill].active = 0;
+                                        kfree((void*)process_table[pid_to_kill].stack_base); // Libera lo stack
+                                        
+                                        // --- NUOVA LOGICA DEMAND PAGING ---
+                                        uint32_t* pt = process_table[pid_to_kill].page_table;
+                                        for (int frame = 0; frame < 1024; frame++) {
+                                            // Se la pagina è mappata (Bit 0 = 1), restituiamo il frame fisico
+                                            if (pt[frame] & 0x01) pfa_free_frame(pt[frame] & 0xFFFFF000);
+                                        }
+                                        kfree(pt); // Infine, distruggiamo la Page Table
+                                        // ----------------------------------
+
+                                        print_term("SUCCESSO: Processo terminato e RAM liberata.");
+                                    } else {
+                                        print_term("ERRORE: PID non valido o app non trovata.");
+                                    }
+                                }
+
+                                
+                                // COMANDO ALLOC (Testiamo l'allocazione di Blocchi e Inode)
+                                else if (term_buffer[0] == 'a' && term_buffer[1] == 'l' && term_buffer[2] == 'l' && term_buffer[3] == 'o' && term_buffer[4] == 'c') {
+                                    print_term("Ricerca di spazio e Inode liberi...");
+                                    render_desktop(mouse_x, mouse_y, is_clicking); 
+                                    
+                                    uint32_t free_block = ext2_allocate_block();
+                                    uint32_t free_inode = ext2_allocate_inode();
+                                    
+                                    if (free_block > 0 && free_inode > 0) {
+                                        char msg1[64]; char num1[32];
+                                        itoa(free_block, num1);
+                                        msg1[0]='\0'; int idx=0; char* label1 = "-> Blocco Dati prenotato: n. ";
+                                        while(*label1) msg1[idx++] = *label1++;
+                                        char* val1 = num1; while(*val1) msg1[idx++] = *val1++; msg1[idx]='\0';
+                                        print_term(msg1);
+
+                                        char msg2[64]; char num2[32];
+                                        itoa(free_inode, num2);
+                                        msg2[0]='\0'; idx=0; char* label2 = "-> Inode prenotato: n. ";
+                                        while(*label2) msg2[idx++] = *label2++;
+                                        char* val2 = num2; while(*val2) msg2[idx++] = *val2++; msg2[idx]='\0';
+                                        print_term(msg2);
+                                        
+                                        print_term("Mappe del disco aggiornate permanentemente.");
+                                    } else {
+                                        print_term("ERRORE: Disco pieno o corrotto.");
+                                    }
+                                }
+                                
+                                // COMANDO CREATE (Es: "create /users/admin/docs/ciao.txt testo")
+                                else if (term_buffer[0] == 'c' && term_buffer[1] == 'r' && term_buffer[2] == 'e' && term_buffer[3] == 'a' && term_buffer[4] == 't' && term_buffer[5] == 'e' && term_buffer[6] == ' ') {
+                                    char full_file[64];
+                                    char filedata[256];
+                                    int idx = 7;
+                                    int f_idx = 0;
+                                    
+                                    if (term_buffer[idx] != '/') full_file[f_idx++] = '/';
+                                    while (term_buffer[idx] != ' ' && term_buffer[idx] != '\0' && f_idx < 63) {
+                                        full_file[f_idx++] = term_buffer[idx++];
+                                    }
+                                    full_file[f_idx] = '\0';
+                                    
+                                    if (term_buffer[idx] == ' ') idx++; 
+                                    
+                                    int d_idx = 0;
+                                    while (term_buffer[idx] != '\0' && d_idx < 255) {
+                                        filedata[d_idx++] = term_buffer[idx++];
+                                    }
+                                    filedata[d_idx] = '\0';
+                                    
+                                    if (f_idx > 1 && d_idx > 0) {
+                                        print_term("Creazione file in corso...");
+                                        render_desktop(mouse_x, mouse_y, is_clicking);
+                                        
+                                        int create_res = ext2_write_file(full_file, filedata, d_idx);
+                                        if (create_res == 1) {
+                                            print_term("SUCCESSO! File creato.");
+                                        } else if (create_res == -1) {
+                                            print_term("ERRORE: Nome duplicato in questa cartella!");
+                                        } else if (create_res == -2) {
+                                            print_term("ERRORE: La cartella madre non esiste!");
+                                        } else {
+                                            print_term("ERRORE: Impossibile creare il file.");
+                                        }
+                                    } else {
+                                        print_term("Sintassi: create /percorso/nome.txt testodelinserire");
+                                    }
+                                }
+                                
+                                // COMANDO MKDIR (Es: "mkdir /users/admin")
+                                else if (term_buffer[0] == 'm' && term_buffer[1] == 'k' && term_buffer[2] == 'd' && term_buffer[3] == 'i' && term_buffer[4] == 'r' && term_buffer[5] == ' ') {
+                                    char full_dir[64];
+                                    int idx = 6;
+                                    int f_idx = 0;
+                                    
+                                    // Se l'utente non ha messo lo slash, lo aggiungiamo noi (crea nella Root)
+                                    if (term_buffer[idx] != '/') {
+                                        full_dir[f_idx++] = '/';
+                                    }
+                                    
+                                    while (term_buffer[idx] != ' ' && term_buffer[idx] != '\0' && f_idx < 63) {
+                                        full_dir[f_idx++] = term_buffer[idx++];
+                                    }
+                                    full_dir[f_idx] = '\0';
+                                    
+                                    if (f_idx > 1) { // 1 perché c'è sempre almeno lo '/'
+                                        print_term("Creazione directory in corso...");
+                                        render_desktop(mouse_x, mouse_y, is_clicking);
+                                        
+                                        int mkdir_res = ext2_make_directory(full_dir);
+                                        if (mkdir_res == 1) {
+                                            print_term("SUCCESSO! Cartella creata. Digita 'ls' per vederla.");
+                                        } else if (mkdir_res == -1) {
+                                            print_term("ERRORE: Un file o cartella con questo nome esiste gia'!");
+                                        } else if (mkdir_res == -2) {
+                                            print_term("ERRORE: La cartella madre non esiste nel percorso specificato!");
+                                        } else {
+                                            print_term("ERRORE: Impossibile creare la cartella.");
+                                        }
+                                    } else {
+                                        print_term("Sintassi: mkdir /percorso/nomecartella");
+                                    }
+                                }
+
+                                // COMANDO RM (Es: "rm /users/admin/docs/test.txt")
+                                else if (term_buffer[0] == 'r' && term_buffer[1] == 'm' && term_buffer[2] == ' ') {
+                                    char full_file[64];
+                                    int idx = 3;
+                                    int f_idx = 0;
+                                    
+                                    if (term_buffer[idx] != '/') full_file[f_idx++] = '/';
+                                    while (term_buffer[idx] != ' ' && term_buffer[idx] != '\0' && f_idx < 63) {
+                                        full_file[f_idx++] = term_buffer[idx++];
+                                    }
+                                    full_file[f_idx] = '\0';
+                                    
+                                    if (f_idx > 1) {
+                                        print_term("Eliminazione file in corso...");
+                                        render_desktop(mouse_x, mouse_y, is_clicking);
+                                        
+                                        int rm_result = ext2_delete_file(full_file);
+                                        
+                                        if (rm_result == 1) {
+                                            print_term("SUCCESSO! File e spazio riciclato correttamente.");
+                                        } else if (rm_result == -1) {
+                                            print_term("ERRORE: Impossibile eliminare una directory con 'rm'.");
+                                        } else {
+                                            print_term("ERRORE: File non trovato o percorso errato.");
+                                        }
+                                    } else {
+                                        print_term("Sintassi: rm /percorso/nomefile.txt");
+                                    }
+                                }
+
+                                // COMANDO RMDIR (Es: "rmdir /cartella/sottocartella")
+                                else if (term_buffer[0] == 'r' && term_buffer[1] == 'm' && term_buffer[2] == 'd' && term_buffer[3] == 'i' && term_buffer[4] == 'r' && term_buffer[5] == ' ') {
+                                    int idx = 6;
+                                    int f_idx = 0;
+                                    
+                                    // Aggiungiamo lo slash alla radice se manca
+                                    if (term_buffer[idx] != '/') pending_rmdir_path[f_idx++] = '/';
+                                    
+                                    while (term_buffer[idx] != ' ' && term_buffer[idx] != '\0' && f_idx < 63) {
+                                        pending_rmdir_path[f_idx++] = term_buffer[idx++];
+                                    }
+                                    pending_rmdir_path[f_idx] = '\0';
+                                    
+                                    // Se ha digitato almeno una lettera oltre allo slash (per non fargli cancellare la root '/')
+                                    if (f_idx > 1) {
+                                        pending_rmdir = 1; // Attiviamo lo stato di allerta
+                                        print_term("ATTENZIONE: Sei sicuro di voler eliminare la cartella");
+                                        print_term("e TUTTO il suo contenuto ricorsivamente? (y/n)");
+                                    } else {
+                                        print_term("Sintassi: rmdir /percorso/nomecartella");
+                                    }
+                                }
+
+                                
+                                // COMANDO CP (Copia file) Es: "cp /cartella/file.txt /dest"
+                                else if (term_buffer[0] == 'c' && term_buffer[1] == 'p' && term_buffer[2] == ' ') {
+                                    char src_path[128];
+                                    char dest_dir[128];
+                                    char filename[64];
+                                    int idx = 3;
+                                    int s_idx = 0, d_idx = 0, f_idx = 0;
+
+                                    // 1. Estraiamo il percorso del file sorgente
+                                    if (term_buffer[idx] != '/') src_path[s_idx++] = '/';
+                                    while (term_buffer[idx] != ' ' && term_buffer[idx] != '\0' && s_idx < 127) {
+                                        src_path[s_idx++] = term_buffer[idx++];
+                                    }
+                                    src_path[s_idx] = '\0';
+
+                                    // 2. Estraiamo la cartella di destinazione
+                                    if (term_buffer[idx] == ' ') idx++;
+                                    if (term_buffer[idx] != '/') dest_dir[d_idx++] = '/';
+                                    while (term_buffer[idx] != ' ' && term_buffer[idx] != '\0' && d_idx < 127) {
+                                        dest_dir[d_idx++] = term_buffer[idx++];
+                                    }
+                                    dest_dir[d_idx] = '\0';
+
+                                    if (s_idx > 1 && d_idx > 1) {
+                                        // 3. Estraiamo solo il NOME del file dalla sorgente (es: "logo.bmp")
+                                        int last_slash = -1;
+                                        for (int i = 0; i < s_idx; i++) {
+                                            if (src_path[i] == '/') last_slash = i;
+                                        }
+                                        for (int i = last_slash + 1; i < s_idx; i++) {
+                                            filename[f_idx++] = src_path[i];
+                                        }
+                                        filename[f_idx] = '\0';
+
+                                        // 4. Creiamo il percorso di destinazione finale
+                                        char final_dest[256];
+                                        int fd_idx = 0;
+                                        for (int i = 0; i < d_idx; i++) final_dest[fd_idx++] = dest_dir[i];
+                                        if (final_dest[fd_idx - 1] != '/') final_dest[fd_idx++] = '/';
+                                        for (int i = 0; i < f_idx; i++) final_dest[fd_idx++] = filename[i];
+                                        final_dest[fd_idx] = '\0';
+
+                                        print_term("Inizializzazione copia in corso...");
+                                        // Stampiamo le variabili per controllare che il parser funzioni
+                                        char msg_src[150] = "Da: ";
+                                        int m_idx = 4; for(int i=0; src_path[i]; i++) msg_src[m_idx++] = src_path[i]; msg_src[m_idx] = '\0';
+                                        print_term(msg_src);
+                                        
+                                        char msg_dst[150] = "A:  ";
+                                        m_idx = 4; for(int i=0; final_dest[i]; i++) msg_dst[m_idx++] = final_dest[i]; msg_dst[m_idx] = '\0';
+                                        print_term(msg_dst);
+                                        
+                                        render_desktop(mouse_x, mouse_y, is_clicking);
+
+                                        int copy_res = ext2_copy_file(src_path, final_dest);
+                                        
+                                        // Forziamo un ridisegno per pulire lo schermo dalla barra scomparsa
+                                        render_desktop(mouse_x, mouse_y, is_clicking); 
+                                        
+                                        // Traduciamo i codici di errore in messaggi testuali per l'utente
+                                        if (copy_res == 1) print_term("SUCCESSO! File copiato.");
+                                        else if (copy_res == -1) print_term("ERRORE: File di destinazione gia' esistente.");
+                                        else if (copy_res == -2) print_term("ERRORE: Cartella di destinazione inesistente.");
+                                        else if (copy_res == -3) print_term("ERRORE: File sorgente inesistente.");
+                                        else if (copy_res == -4) print_term("ERRORE: File troppo grande per la RAM (Max 10MB).");
+                                        else if (copy_res == -5) print_term("ERRORE: RAM del Kernel insufficiente.");
+                                        else if (copy_res == -6) print_term("ERRORE: Disco attualmente occupato. Riprova.");
+                                        else print_term("ERRORE: Scrittura fallita (Disco pieno o corrotto).");
+                                        
+                                    } else {
+                                        print_term("Sintassi: cp /sorgente/file.txt /destinazione");
+                                    }
+                                }
+
+
+                                // COMANDO INSMOD (Carica un Modulo Driver) Es: "insmod /system/drivers/test.drv"
+                                
+                                else if (term_buffer[0] == 'i' && term_buffer[1] == 'n' && term_buffer[2] == 's' && term_buffer[3] == 'm' && term_buffer[4] == 'o' && term_buffer[5] == 'd') {
+                                    
+                                    if (term_buffer[6] == ' ') {
+                                        char drv_path[64];
+                                        int d_idx = 0; int idx = 7;
+                                        
+                                        if (term_buffer[idx] != '/') drv_path[d_idx++] = '/';
+                                        while(term_buffer[idx] != '\0' && term_buffer[idx] != ' ' && d_idx < 63) {
+                                            drv_path[d_idx++] = term_buffer[idx++];
+                                        }
+                                        drv_path[d_idx] = '\0';
+                                        
+                                        print_term("Caricamento Modulo Kernel in corso...");
+                                        render_desktop(mouse_x, mouse_y, is_clicking);
+                                        
+                                        int res = load_driver(drv_path);
+                                        
+                                        if (res == 1) print_term("SUCCESSO! Audio in riproduzione in background!");
+                                        else if (res == 10) print_term("SB16 ERRORE: Scheda non rilevata o spenta.");
+                                        else if (res == 11) print_term("SB16 ERRORE: Memoria RAM DMA esaurita.");
+                                        else if (res == 12) print_term("SB16 ERRORE: Il file /startup.wav non esiste!");
+                                        else if (res == 13) print_term("SB16 ERRORE: Il file audio e' corrotto o vuoto.");
+                                        else if (res == 14) print_term("SB16 ERRORE: Formato errato. Richiesto WAV 8-bit Mono!");
+                                        else if (res == 15) print_term("SB16 ERRORE: Nessun dato audio trovato nel file.");
+                                        else if (res == 0) print_term("Modulo eseguito e scaricato correttamente dalla RAM.");
+                                        else if (res == -1) print_term("ERRORE: Modulo .drv non trovato sul disco.");
+                                        else if (res == -3) print_term("ERRORE: Memoria Kernel insufficiente.");
+                                        else print_term("ERRORE FATALE: Il driver ha fallito l'inizializzazione.");
+                                    } else {
+                                        print_term("Sintassi: insmod /system/drivers/nome.drv");
+                                    }
+                                }
+
+                                //AGGIUNGI QUI SOPRA I NUOVI COMANDI SE SERVE =!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=
+                                else if (term_len > 0) {
+                                    print_term("Errore: Comando non trovato.");
+                                }
+                                
+                                term_len = 0; 
+                                term_cursor = 0; // AGGIUNTO IL RESET CURSORE
+                            }
+                            else if (ascii >= 32 && ascii <= 126 && term_len < 254) { // MODIFICATA QUESTA CONDIZIONE
+                                // Spostiamo a destra tutte le lettere successive
+                                for (int k = term_len; k >= term_cursor; k--) {
+                                    term_buffer[k + 1] = term_buffer[k];
+                                }
+                                term_buffer[term_cursor] = ascii; // Inseriamo la lettera
+                                term_cursor++;
+                                term_len++;
+                            }
+                            
+                            blink_counter = 0;
+                            render_desktop(mouse_x, mouse_y, is_clicking);
+                        }
+                    } 
+                }
+            }
+        }
+        read_rtc(); 
+        if (rtc_second != last_second) {
+            last_second = rtc_second; // Aggiorniamo la memoria
+            // L'orologio è scattato: Ridisegna
+            refresh_requested = 1;
+            // è passato un secondo! Forziamo un ridisegno per aggiornare l'orologio
+            
+        }
+    }
+} 

@@ -1,0 +1,1 @@
+#define RTLD_DEFAULT ((void *)0)
