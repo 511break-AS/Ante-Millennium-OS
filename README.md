@@ -1,5 +1,5 @@
 # 💿 Ante-Millennium OS (Ante-M) x86
-## [Aggiornamento build 110 nei prossimi giorni] 
+## V 0.1 Alpha - build 110
 
 ![Version](https://img.shields.io/badge/version-0.1_Alpha-blue.svg)
 ![Architecture](https://img.shields.io/badge/arch-x86_32--bit-red.svg)
@@ -13,7 +13,8 @@
 Nasce come progetto di esplorazione tecnica per ricreare le complesse architetture dei sistemi operativi classici (tra cui Multitasking Preemptive, Demand Paging, Virtual File System Ext2 e Moduli Kernel Caricabili), unita a un'interfaccia grafica nativa ("Retained Mode") ispirata all'estetica iconica degli anni '90 e dei primi anni 2000. Il sistema è un ecosistema totalmente autosufficiente: non si appoggia ad alcuna libreria standard o codice di terze parti, comunica direttamente con l'hardware e include un proprio SDK (la libreria antem_libc) per lo sviluppo e la compilazione di applicazioni User-Space nel formato proprietario .edxi.
 
 
-![Screenshot 2026-03-30 alle 22 48 59](https://github.com/user-attachments/assets/2f843118-85ae-4213-a04b-2f79a7a572f4)
+<img width="977" height="764" alt="Screenshot 2026-06-27 alle 18 02 49" src="https://github.com/user-attachments/assets/917542ad-5370-4c9f-90d5-abe792b745ad" />
+
 
 ---
 
